@@ -222,6 +222,26 @@ func TestTimeoutKeepsTheSession(t *testing.T) {
 	}
 }
 
+func TestMentionSender(t *testing.T) {
+	const id = "6a7d7188238a191436b929da"
+	for _, tc := range []struct {
+		t    proto.Task
+		in   string
+		want string
+	}{
+		{proto.Task{UserID: id}, "done", "<@" + id + ">\n\ndone"},
+		{proto.Task{UserID: id}, "", ""},                            // posts nothing
+		{proto.Task{UserID: id, Trigger: "alerts"}, "done", "done"}, // nobody sent it
+		{proto.Task{UserID: "all"}, "done", "done"},                 // never <@all>
+		{proto.Task{UserID: "x> <@all"}, "done", "done"},            // nor anything that is not an id
+		{proto.Task{UserID: ""}, "done", "done"},
+	} {
+		if got := mentionSender(tc.t, tc.in); got != tc.want {
+			t.Errorf("mentionSender(%+v, %q) = %q, want %q", tc.t, tc.in, got, tc.want)
+		}
+	}
+}
+
 // TestSessionsRunSideBySide: a task addressed to another session does not wait for the room's
 // current one, a task addressed to the current session does, and no session ever has two runs
 // at once.
@@ -323,7 +343,9 @@ func TestEndToEnd(t *testing.T) {
 	defer hs.Close()
 
 	f := newFixture(t)
+	const member = "6a7d7188238a191436b929da" // shaped like a Tanka member id, so replies mention it
 	f.cfg.ServerURL, f.cfg.EnrollToken = hs.URL, "enroll"
+	f.cfg.AllowedUsers = append(f.cfg.AllowedUsers, member)
 	w, err := New(f.cfg)
 	if err != nil {
 		t.Fatal(err)
@@ -373,6 +395,9 @@ func TestEndToEnd(t *testing.T) {
 	}
 	if r := say("U1", "zebra-canary"); !strings.Contains(r, "echo: zebra-canary") {
 		t.Fatalf("canary: %q", r)
+	}
+	if r := say(member, "who asked"); !strings.HasPrefix(r, "<@"+member+">\n\necho: who asked") {
+		t.Fatalf("reply to a member does not mention them first: %q", r)
 	}
 	if r := say("U1", "status"); !strings.Contains(r, "**Workdir** `") {
 		t.Fatalf("status: %q", r)

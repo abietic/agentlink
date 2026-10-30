@@ -14,6 +14,7 @@ import (
 	"fmt"
 	"log"
 	"net/url"
+	"regexp"
 	"slices"
 	"strconv"
 	"strings"
@@ -326,7 +327,7 @@ func (w *Worker) lockSession(sid string) func() {
 
 // send seals and posts a result, retrying only when the request may not have reached the server.
 func (w *Worker) send(t proto.Task, text string) {
-	plain, _ := json.Marshal(proto.Result{Text: text})
+	plain, _ := json.Marshal(proto.Result{Text: mentionSender(t, text)})
 	sealed, err := seal.Seal(w.key, w.serverKey, proto.ResultContext(w.id.DeviceID, t.ID), plain)
 	if err != nil {
 		log.Printf("task %s: seal result: %v", t.ID, err)
@@ -346,6 +347,19 @@ func (w *Worker) send(t proto.Task, text string) {
 		}
 		time.Sleep(time.Duration(attempt) * 2 * time.Second)
 	}
+}
+
+// mentionable is what a Tanka member id looks like; it also keeps "<@all>" out.
+var mentionable = regexp.MustCompile(`^[0-9A-Za-z]{8,64}$`)
+
+// mentionSender puts a mention of whoever sent t on a line of its own above the reply, so
+// Tanka notifies them when it lands. Triggered tasks have no sender, and an empty reply posts
+// nothing.
+func mentionSender(t proto.Task, text string) string {
+	if text == "" || t.Trigger != "" || !mentionable.MatchString(t.UserID) {
+		return text
+	}
+	return "<@" + t.UserID + ">\n\n" + text
 }
 
 type command struct{ name, arg, prompt string }
