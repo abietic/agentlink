@@ -1,6 +1,7 @@
 package worker
 
 import (
+	"encoding/json"
 	"errors"
 	"os"
 	"path/filepath"
@@ -15,7 +16,9 @@ type Config struct {
 	ServerURL   string `json:"server_url"`
 	EnrollToken string `json:"enroll_token"` // only needed until the device is registered
 	Name        string `json:"name"`         // shown when a room pairs; default hostname
-	StateDir    string `json:"state_dir"`    // default ~/.agentlink
+	StateDir    string `json:"state_dir"`    // worker.db and worker.key; default ~/.agentlink
+	// Bot is the server's bot this device pairs through; empty means the server's default.
+	Bot string `json:"bot"`
 
 	// AllowedUsers are the Tanka user ids that may drive this device. Everyone else is
 	// refused, with their id in the reply so it can be added here.
@@ -24,13 +27,16 @@ type Config struct {
 	WorkdirRoots   []string `json:"workdir_roots"`
 	DefaultWorkdir string   `json:"default_workdir"` // default the first root
 
-	ClaudeBin string `json:"claude_bin"` // default "claude"
-	// ClaudeArgs are appended to every run. Default ["--permission-prompts", "none"]:
-	// anything that would ask for permission is denied, since nobody is there to answer.
-	ClaudeArgs     []string `json:"claude_args"`
-	TimeoutSec     int      `json:"timeout_sec"`      // per run; default 1800, keep below the server's lease_sec
-	MaxConcurrency int      `json:"max_concurrency"`  // runs at once across rooms; default 2
-	MaxOutputChars int      `json:"max_output_chars"` // reply body cap; default 3500
+	// Runner runs one prompt through the Claude Agent SDK, normally
+	// ["node", "<repo>/sdk/runner.mjs"] after `npm ci` in sdk/.
+	Runner []string `json:"runner"`
+	// SDKOptions go to the SDK's query() as options; cwd and the session are set per run.
+	// Default {"permissionMode": "dontAsk"}: tool calls that are not pre-approved are
+	// denied, since nobody is there to answer a permission prompt.
+	SDKOptions     json.RawMessage `json:"sdk_options"`
+	TimeoutSec     int             `json:"timeout_sec"`      // per run; default 1800, keep below the server's lease_sec
+	MaxConcurrency int             `json:"max_concurrency"`  // runs at once across rooms; default 2
+	MaxOutputChars int             `json:"max_output_chars"` // reply body cap; default 3500
 }
 
 func LoadConfig(path string) (Config, error) {
@@ -47,6 +53,9 @@ func LoadConfig(path string) (Config, error) {
 	}
 	if c.ServerURL == "" {
 		return c, errors.New("server_url is required")
+	}
+	if len(c.Runner) == 0 {
+		return c, errors.New(`runner is required, e.g. ["node", "/path/to/agentlink/sdk/runner.mjs"]`)
 	}
 	return c, c.applyDefaults()
 }
@@ -74,11 +83,8 @@ func (c *Config) applyDefaults() error {
 		return errors.New("default_workdir: " + err.Error())
 	}
 	c.DefaultWorkdir = dir
-	if c.ClaudeBin == "" {
-		c.ClaudeBin = "claude"
-	}
-	if c.ClaudeArgs == nil {
-		c.ClaudeArgs = []string{"--permission-prompts", "none"}
+	if c.SDKOptions == nil {
+		c.SDKOptions = json.RawMessage(`{"permissionMode":"dontAsk"}`)
 	}
 	if c.TimeoutSec <= 0 {
 		c.TimeoutSec = 1800

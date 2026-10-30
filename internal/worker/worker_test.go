@@ -20,19 +20,25 @@ import (
 	"agentlink/internal/tanka"
 )
 
-// stubClaude stands in for the claude CLI: it logs its args, echoes the prompt and cwd,
-// and reports the session id it was given. The prompt "sleep" makes it hang.
-const stubClaude = `#!/bin/sh
-printf '%s\n' "$*" >> "$AGENTLINK_STUB_LOG"
-sid=""
-while [ $# -gt 0 ]; do
-  case "$1" in --session-id|--resume) sid="$2"; shift ;; esac
-  shift
-done
-prompt=$(cat)
-case "$prompt" in sleep) exec sleep 5 ;; esac
-printf '{"type":"result","subtype":"success","is_error":false,"result":"echo: %s @ %s","session_id":"%s","num_turns":1,"total_cost_usd":0.01,"permission_denials":[]}\n' "$prompt" "$(pwd)" "$sid"
-`
+// TestMain lets the test binary stand in for sdk/runner.mjs: with AGENTLINK_STUB_RUNNER
+// set it logs the request there, echoes the prompt and cwd, and reports the session id it
+// was given. The prompt "sleep" makes it hang.
+func TestMain(m *testing.M) {
+	if logPath := os.Getenv("AGENTLINK_STUB_RUNNER"); logPath != "" {
+		var req runRequest
+		json.NewDecoder(os.Stdin).Decode(&req)
+		f, _ := os.OpenFile(logPath, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o600)
+		json.NewEncoder(f).Encode(req)
+		f.Close()
+		if req.Prompt == "sleep" {
+			time.Sleep(5 * time.Second)
+		}
+		cwd, _ := os.Getwd()
+		json.NewEncoder(os.Stdout).Encode(runReply{Type: "result", Text: "echo: " + req.Prompt + " @ " + cwd, SessionID: req.SessionID, NumTurns: 1, TotalCostUSD: 0.01})
+		return
+	}
+	os.Exit(m.Run())
+}
 
 type fixture struct {
 	cfg  Config
@@ -46,18 +52,14 @@ func newFixture(t *testing.T) *fixture {
 	root, _ := filepath.EvalSymlinks(dir)
 	root = filepath.Join(root, "code")
 	os.MkdirAll(filepath.Join(root, "sub"), 0o755)
-	bin := filepath.Join(dir, "claude")
-	if err := os.WriteFile(bin, []byte(stubClaude), 0o755); err != nil {
-		t.Fatal(err)
-	}
-	log := filepath.Join(dir, "args.log")
-	t.Setenv("AGENTLINK_STUB_LOG", log)
+	log := filepath.Join(dir, "runs.log")
+	t.Setenv("AGENTLINK_STUB_RUNNER", log)
 	cfg := Config{
 		Name:         "test-laptop",
 		StateDir:     filepath.Join(dir, "state"),
 		AllowedUsers: []string{"U1"},
 		WorkdirRoots: []string{root},
-		ClaudeBin:    bin,
+		Runner:       []string{os.Args[0]},
 		TimeoutSec:   10,
 	}
 	if err := cfg.applyDefaults(); err != nil {
@@ -66,21 +68,16 @@ func newFixture(t *testing.T) *fixture {
 	return &fixture{cfg: cfg, root: root, log: log}
 }
 
-func (f *fixture) lastArgs(t *testing.T) string {
+// last is the request the runner got most recently.
+func (f *fixture) last(t *testing.T) runRequest {
 	t.Helper()
 	b, _ := os.ReadFile(f.log)
 	lines := strings.Split(strings.TrimSpace(string(b)), "\n")
-	return lines[len(lines)-1]
-}
-
-func flagValue(args, flag string) string {
-	f := strings.Fields(args)
-	for i := range f[:len(f)-1] {
-		if f[i] == flag {
-			return f[i+1]
-		}
+	var req runRequest
+	if err := json.Unmarshal([]byte(lines[len(lines)-1]), &req); err != nil {
+		t.Fatalf("runner log: %v", err)
 	}
-	return ""
+	return req
 }
 
 func TestParseCommand(t *testing.T) {
@@ -131,7 +128,7 @@ func TestSessionLifecycle(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	w.state.DeviceID = "dev-test"
+	w.id.DeviceID = "dev-test"
 	ctx := context.Background()
 	task := func(text string) proto.Task { return proto.Task{ID: "t", RoomID: "R1", UserID: "U1", Text: text} }
 
@@ -139,23 +136,22 @@ func TestSessionLifecycle(t *testing.T) {
 	if !strings.Contains(reply, "echo: hello @ "+f.root) || !strings.Contains(reply, "`dev-test`") {
 		t.Fatalf("first reply: %q", reply)
 	}
-	first := flagValue(f.lastArgs(t), "--session-id")
-	if !isUUID(first) || !strings.Contains(f.lastArgs(t), "--permission-prompts none") {
-		t.Fatalf("first run args: %q", f.lastArgs(t))
+	first := f.last(t).SessionID
+	if !isUUID(first) || f.last(t).Resume || string(f.last(t).Options) != `{"permissionMode":"dontAsk"}` {
+		t.Fatalf("first run: %+v", f.last(t))
 	}
 
 	w.handle(ctx, task("again"))
-	if got := flagValue(f.lastArgs(t), "--resume"); got != first {
-		t.Fatalf("second run should resume %s, args: %q", first, f.lastArgs(t))
+	if got := f.last(t); !got.Resume || got.SessionID != first {
+		t.Fatalf("second run should resume %s: %+v", first, got)
 	}
 
 	if r := w.handle(ctx, task("new")); !strings.Contains(r, "new session") {
 		t.Fatalf("new reply: %q", r)
 	}
 	w.handle(ctx, task("fresh start"))
-	second := flagValue(f.lastArgs(t), "--session-id")
-	if second == "" || second == first {
-		t.Fatalf("new should start another session, args: %q", f.lastArgs(t))
+	if got := f.last(t); got.Resume || got.SessionID == first {
+		t.Fatalf("new should start another session: %+v", got)
 	}
 
 	if r := w.handle(ctx, task("cd ../..")); !strings.Contains(r, "outside the allowed workdir roots") {
@@ -167,8 +163,8 @@ func TestSessionLifecycle(t *testing.T) {
 	if r := w.handle(ctx, task("in sub")); !strings.Contains(r, "@ "+filepath.Join(f.root, "sub")) {
 		t.Fatalf("run after cd: %q", r)
 	}
-	if flagValue(f.lastArgs(t), "--session-id") == "" {
-		t.Fatalf("cd should start a new session, args: %q", f.lastArgs(t))
+	if f.last(t).Resume {
+		t.Fatalf("cd should start a new session: %+v", f.last(t))
 	}
 
 	list := w.query("R1", "sessions")
@@ -178,8 +174,8 @@ func TestSessionLifecycle(t *testing.T) {
 	if r := w.handle(ctx, task("resume 3 back to the first one")); !strings.Contains(r, "@ "+f.root) {
 		t.Fatalf("resume reply: %q", r)
 	}
-	if got := flagValue(f.lastArgs(t), "--resume"); got != first {
-		t.Fatalf("resume 3 should continue %s, args: %q", first, f.lastArgs(t))
+	if got := f.last(t); !got.Resume || got.SessionID != first {
+		t.Fatalf("resume 3 should continue %s: %+v", first, got)
 	}
 	if r := w.handle(ctx, task("resume zzzz")); !strings.Contains(r, "No session") {
 		t.Fatalf("unknown resume: %q", r)
@@ -194,7 +190,7 @@ func TestSessionLifecycle(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if rs := w2.state.Rooms["R1"]; rs == nil || rs.SessionID != first || len(rs.Sessions) != 3 {
+	if rs := w2.state["R1"]; rs == nil || rs.SessionID != first || len(rs.Sessions) != 3 {
 		t.Fatalf("room state after restart: %+v", rs)
 	}
 }
@@ -210,9 +206,9 @@ func TestTimeoutKeepsTheSession(t *testing.T) {
 	if !strings.Contains(reply, "Timed out") {
 		t.Fatalf("reply: %q", reply)
 	}
-	sid := flagValue(f.lastArgs(t), "--session-id")
-	if w.state.Rooms["R1"].SessionID != sid {
-		t.Fatalf("timed-out session %s not kept: %+v", sid, w.state.Rooms["R1"])
+	sid := f.last(t).SessionID
+	if w.state["R1"].SessionID != sid {
+		t.Fatalf("timed-out session %s not kept: %+v", sid, w.state["R1"])
 	}
 }
 
@@ -228,13 +224,15 @@ func TestEndToEnd(t *testing.T) {
 	}))
 	defer fake.Close()
 
+	srvDB := filepath.Join(t.TempDir(), "server.db")
 	srv, err := server.New(server.Config{
-		SigningSecret: signing, EnrollToken: "enroll", PollWaitSec: 1,
-		StatePath: filepath.Join(t.TempDir(), "server.json"), ResponseURLPrefix: fake.URL + "/",
+		EnrollToken: "enroll", PollWaitSec: 1, DBPath: srvDB, ResponseURLPrefix: fake.URL + "/",
+		Bots: []server.Bot{{Name: "main", SigningSecret: signing}},
 	})
 	if err != nil {
 		t.Fatal(err)
 	}
+	defer srv.Close()
 	hs := httptest.NewServer(srv.Handler())
 	defer hs.Close()
 
@@ -287,6 +285,9 @@ func TestEndToEnd(t *testing.T) {
 	if !strings.Contains(r, "echo: ping @ "+f.root) {
 		t.Fatalf("ping: %q", r)
 	}
+	if r := say("U1", "zebra-canary"); !strings.Contains(r, "echo: zebra-canary") {
+		t.Fatalf("canary: %q", r)
+	}
 	if r := say("U1", "status"); !strings.Contains(r, "**Workdir** `") {
 		t.Fatalf("status: %q", r)
 	}
@@ -302,5 +303,12 @@ func TestEndToEnd(t *testing.T) {
 		}
 	case <-time.After(10 * time.Second):
 		t.Fatal("worker did not stop")
+	}
+
+	// Both databases (and their WAL files) only ever held the prompt encrypted.
+	for _, p := range []string{srvDB, srvDB + "-wal", filepath.Join(f.cfg.StateDir, "worker.db"), filepath.Join(f.cfg.StateDir, "worker.db-wal")} {
+		if b, _ := os.ReadFile(p); bytes.Contains(b, []byte("zebra-canary")) {
+			t.Errorf("%s holds the prompt in plain text", filepath.Base(p))
+		}
 	}
 }

@@ -28,24 +28,24 @@ func NewClient(base string) *Client {
 	return &Client{BaseURL: strings.TrimRight(base, "/"), HTTP: &http.Client{Timeout: 90 * time.Second}}
 }
 
-func (c *Client) Register(ctx context.Context, enrollToken, name string) (proto.RegisterResponse, error) {
+func (c *Client) Register(ctx context.Context, enrollToken string, req proto.RegisterRequest) (proto.RegisterResponse, error) {
 	var out proto.RegisterResponse
-	_, err := c.do(ctx, http.MethodPost, "/api/v1/register", enrollToken, proto.RegisterRequest{Name: name}, &out)
+	_, err := c.do(ctx, http.MethodPost, "/api/v1/register", enrollToken, req, &out)
 	return out, err
 }
 
-// Poll long-polls for the next task; nil means none arrived within the server's wait.
-func (c *Client) Poll(ctx context.Context) (*proto.Task, error) {
-	var t proto.Task
-	code, err := c.do(ctx, http.MethodGet, "/api/v1/poll", c.Token, nil, &t)
+// Poll long-polls for the next sealed task; nil means none arrived within the server's wait.
+func (c *Client) Poll(ctx context.Context) (*proto.Envelope, error) {
+	var env proto.Envelope
+	code, err := c.do(ctx, http.MethodGet, "/api/v1/poll", c.Token, nil, &env)
 	if err != nil || code == http.StatusNoContent {
 		return nil, err
 	}
-	return &t, nil
+	return &env, nil
 }
 
-func (c *Client) Result(ctx context.Context, taskID, text string) error {
-	_, err := c.do(ctx, http.MethodPost, "/api/v1/tasks/"+url.PathEscape(taskID)+"/result", c.Token, proto.Result{Text: text}, nil)
+func (c *Client) Result(ctx context.Context, env proto.Envelope) error {
+	_, err := c.do(ctx, http.MethodPost, "/api/v1/tasks/"+url.PathEscape(env.ID)+"/result", c.Token, env, nil)
 	return err
 }
 

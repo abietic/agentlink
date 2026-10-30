@@ -1,0 +1,24 @@
+# /etc/systemd/system/agentlink-server.service
+# Secrets go in /etc/agentlink/server.env (root, 0600), read by systemd before it drops
+# privileges: AGENTLINK_ENROLL_TOKEN=..., AGENTLINK_SIGNING_SECRET_<BOT>=...
+[Unit]
+Description=agentlink server (Tanka bot endpoint)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+ExecStart=/opt/agentlink/agentlink-server -config /etc/agentlink/server.json
+EnvironmentFile=/etc/agentlink/server.env
+DynamicUser=yes
+StateDirectory=agentlink
+StateDirectoryMode=0700
+Restart=on-failure
+RestartSec=5
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+MemoryMax=256M
+
+[Install]
+WantedBy=multi-user.target

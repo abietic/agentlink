@@ -1,16 +1,28 @@
 # agentlink
 
-在 Tanka 群里 @ 机器人，消息就交给一台配对好的机器，由 Claude Code 在那台机器上执行，结果回帖到同一个群（挂在原消息下面）。服务端只负责收发和路由；源码、凭证和执行都留在 worker 所在的机器上。
+在 Tanka 群里 @ 机器人，消息就交给一台配对好的机器，由 Claude Agent SDK 在那台机器上执行，结果回帖到同一个群（挂在原消息下面）。服务端只负责收发和路由；源码、凭证和执行都留在 worker 所在的机器上。
 
 ```
-Tanka 群 ──@bot──▶ agentlink-server ◀──长轮询── agentlink-worker ──▶ claude -p
-   ▲      app_mention   (公网 HTTPS)    出站 HTTPS   （本机 / 内网）   （工作目录 + 会话）
-   └──────── response_url / 群 webhook ◀── 结果 ──────┘
+Tanka 群 ──@bot──▶ agentlink-server ◀──长轮询── agentlink-worker ──▶ node sdk/runner.mjs ──▶ Agent SDK query()
+   ▲   app_mention   (公网 HTTPS)  密文任务/结果  （本机 / 内网）        （工作目录 + 会话）
+   └──────── response_url / 群 webhook ◀───────────┘
 ```
 
-- **server**：校验 Tanka 签名，按 `room_id` 找到配对的设备，把消息放进该设备的内存队列；worker 交回结果后，用事件里的 `response_url` 回帖，失败再用该群的 incoming webhook。
+- **server**：校验 Tanka 签名，按 `(bot, room_id)` 找到配对的设备，把任务加密后放进该设备的队列（SQLite）；worker 交回结果后，用事件里的 `response_url` 回帖，失败再用该群的 incoming webhook。
 - **worker**：凭 device id / token 与 server 配对，只发出站请求（不需要公网入口）。每个群在本机有自己的工作目录和当前会话：默认续接当前会话，也可以新建、切回旧会话或换目录。
-- **为什么不用 Agent SDK**：官方 Agent SDK 只有 Python 和 TypeScript。官方文档给其他语言的路径是以子进程方式跑 `claude -p --output-format json`，底层与 SDK 是同一套 harness。新建会话时 worker 自己生成 UUID，用 `--session-id` 传入；续接用 `--resume <id>`；prompt 走 stdin。
+- **执行走官方 Agent SDK**：Go 没有官方 SDK，worker 每条 prompt 起一个 `node sdk/runner.mjs`，由它调用 `@anthropic-ai/claude-agent-sdk` 的 `query()`。新会话用 `options.sessionId`（worker 自己生成的 UUID），续接用 `options.resume`，会话 id 不变；SIGTERM 会 abort 这次 query，已做的部分留在会话里。`sdk_options` 原样传给 `query()`。
+
+## 多机器人、多设备
+
+- server 可以同时接多个 Tanka 应用（`bots`），每个的事件地址是 `POST /tanka/events/<name>`；`POST /tanka/events` 是默认机器人。
+- worker 用 `bot` 选择通过哪个机器人配对，不填就是 server 的默认机器人。设备只能在自己那个机器人所在的群里 `pair`。
+- 每台设备有独立的任务队列，多台设备同时在线互不影响；同一台设备上，每个群按顺序执行，所有群合计最多同时跑 `max_concurrency` 个。
+
+## 加密
+
+- **端到端（server ⇄ worker）**：设备注册时生成 X25519 密钥对并上报公钥，同时记下 server 的公钥。任务在 server 收到的那一刻就用「临时密钥 + 双方长期密钥」派生的 AES-256-GCM 密钥加密给该设备，结果同样加密给 server；附加数据绑定 `task|result <device-id> <task-id>`，所以一个设备的任务不能被另一个设备解开，结果也不能被冒充或挪到别的任务上。中间的 TLS 终止代理（如 Cloudflare）和 server 的数据库都只看到密文。
+- **落盘**：两边都用 SQLite（`modernc.org/sqlite`，纯 Go）。server 的 `response_url` 和自己的私钥用本地存储密钥（`key_path`，首次启动生成，0600）加密；任务内容本来就是只有设备能解的密文。worker 的身份、令牌、私钥、各群状态和会话标题整体加密存在 `~/.agentlink/worker.db`，密钥在 `~/.agentlink/worker.key`。
+- Tanka → server 这一段只能是明文（server 要读命令），靠 Tanka 签名校验。
 
 ## 群里的用法
 
@@ -27,78 +39,53 @@ Tanka 群 ──@bot──▶ agentlink-server ◀──长轮询── agentlin
 | `help` 或只 @ 不写内容 | 帮助 |
 | 其他任何内容 | 作为 prompt，在当前会话里执行 |
 
-命令词不区分大小写，可以带 `/`。同一个群的任务按顺序执行，所有群合计最多同时跑 `max_concurrency` 个。
+命令词不区分大小写，可以带 `/`。
 
 ## 部署
 
 ### 1. Tanka 应用
 
-在 Tanka 开放平台建一个应用（或沿用已有应用），然后：
+在 [Tanka 开放平台](https://open.tanka.ai/apps) 建一个应用（或沿用已有应用），然后：
 
-1. 打开 Event Subscriptions，Request URL 填 `https://<server 域名>/tanka/events`。保存时 Tanka 会发一条带签名的 `url_verification` 请求，server 必须先跑起来。
-2. 订阅 `app_mention` 事件。
-3. 记下 App Signing Secret。
-4. 把机器人拉进要用的群。
-
-如果要启用 webhook 兜底，就给每个群建一个 incoming webhook，填进 `room_webhooks`。
+1. Event Subscriptions 的 Request URL 填 `https://<server 域名>/tanka/events/<bot name>`。保存时 Tanka 会发一条带签名的 `url_verification`，server 必须先跑起来并配好这个机器人的 Signing Secret。
+2. 订阅 `app_mention`。
+3. 把机器人拉进要用的群。需要 webhook 兜底的群，建一个 incoming webhook 填进该机器人的 `room_webhooks`。
 
 ### 2. server（公网，HTTPS）
 
 ```bash
-go install ./cmd/agentlink-server
-export AGENTLINK_SIGNING_SECRET=...   # Tanka App Signing Secret
-export AGENTLINK_ENROLL_TOKEN=...     # 自己生成的长随机串，worker 首次注册时要用
-agentlink-server -config examples/server.json
+GOOS=linux GOARCH=amd64 CGO_ENABLED=0 go build -o bin/agentlink-server ./cmd/agentlink-server
 ```
 
-- server 只监听 HTTP，TLS 由前面的反向代理或 ingress 负责。
-- 反代的读超时要大于 `poll_wait_sec`（默认 25 秒）。
-- `/healthz` 是存活探针。
-- 状态文件（`state_path`）只保存设备（token 存 SHA-256）和群绑定，权限是 0600。
-- 消息正文只放在内存里，交回结果后即删除；日志里只有 id，没有正文。
+- 配置见 `examples/server.json`；密钥用环境变量给：`AGENTLINK_ENROLL_TOKEN`（自己生成的长随机串，worker 首次注册用）、`AGENTLINK_SIGNING_SECRET_<BOT>`（机器人名大写，`-` 换成 `_`）。
+- systemd 单元见 `examples/agentlink-server.service`。server 只监听 HTTP（默认 `127.0.0.1:8080`），TLS 由前面的反向代理负责，读超时要大于 `poll_wait_sec`（默认 25 秒）。
+- `/healthz` 是存活探针。日志里只有 id，没有正文。
+- 队列持久化：server 重启后，排队中的任务照样会交给设备；没人取的任务 `queue_ttl_sec`（默认 10 分钟）后丢弃并回帖说明，取走但没交结果的 `lease_sec` 后丢弃。
 
 ### 3. worker（干活的机器）
 
 ```bash
 go install ./cmd/agentlink-worker
-mkdir -p ~/.agentlink && cp examples/worker.json ~/.agentlink/worker.json   # 改 server_url / allowed_users
+(cd sdk && npm ci)                       # 装 Agent SDK
+mkdir -p ~/.agentlink && cp examples/worker.json ~/.agentlink/worker.json   # 改 server_url / runner / allowed_users
 AGENTLINK_ENROLL_TOKEN=... agentlink-worker
 ```
 
-1. 首次启动会向 server 注册，拿到 `device_id` / token，存进 `~/.agentlink/worker.state.json`（0600）。之后启动就不再需要 enroll token。
+1. 首次启动会生成密钥对、向 server 注册，拿到 `device_id`。之后启动不再需要 enroll token；换 `server_url` 或 `bot` 会重新注册（新的 device id）。
 2. 在群里 @ 机器人，发 `pair <device-id>`。
-3. 发一条 prompt。如果 `allowed_users` 是空的，回复会写出你的 Tanka user id。把它填进 `allowed_users`，再重启 worker。
-4. 需要常驻的话，见 `examples/com.agentlink.worker.plist`（launchd）。
+3. 发一条 prompt。如果 `allowed_users` 是空的，回复会写出你的 Tanka user id；填进 `allowed_users` 后重启 worker。
+4. 常驻见 `examples/com.agentlink.worker.plist`（launchd）。
 
 ## 安全模型
 
-- **入口**
-  - 每个事件都要通过 HMAC 签名校验，时间戳在 ±5 分钟窗口内。
-  - `event_id` 去重，Tanka 重投不会重复执行。
-  - `response_url` 只接受 `response_url_prefix` 开头的地址。
-- **谁能驱动机器**
-  - server 的 `allowed_users` 是可选的粗过滤。
-  - 最终由 worker 本机的 `allowed_users` 决定。默认拒绝所有人，名单不在 server 上。
-  - 设备注册需要 enroll token。
-- **能做什么**
-  - 工作目录限制在 `workdir_roots` 之内（先解析符号链接再判断）。
-  - 默认参数 `--permission-prompts none`：需要人工确认的工具调用一律拒绝，回复里会注明被拒绝的次数。要放开写文件或执行 Bash，在 `claude_args` 里加 `--permission-mode acceptEdits`、`--allowedTools ...` 等。
-  - 群消息是不可信输入，可能被用来做 prompt 注入，所以权限要按需最小化。
-- **数据**
-  - 回复里会带 worker 的输出，内容由你的 prompt 决定。
-  - 会话的完整记录留在 worker 本机，位于 Claude Code 自己的 `~/.claude/projects`。
-
-## 联调时要确认的点
-
-文档里没写清楚、要拿真实 Tanka 验证的地方：
-
-- `app_mention` 的 `text` 里机器人提及的实际格式（`@名字` 还是 `<@ID>`）。名字带空格时，要把它配进 `bot_names`。
-- `response_url` 的实际域名是否就是 `https://api.tanka.ai/`，以及有效期多长。长任务超过有效期时会走 webhook 兜底，所以 `room_webhooks` 最好配上。
-- 群消息对 markdown 的渲染效果，以及单条消息的长度上限（`max_reply_chars` / `max_output_chars`）。
+- **入口**：每个事件都要通过对应机器人的 HMAC 签名校验（±5 分钟）；配了 `app_id` 的机器人还要求 `api_app_id` 一致；`event_id` 去重（持久化，重启后也不会重复执行）；`response_url` 只接受 `response_url_prefix` 开头的地址。
+- **谁能驱动机器**：server 的 `allowed_users` 是可选的粗过滤；最终由 worker 本机的 `allowed_users` 决定，默认拒绝所有人。设备注册需要 enroll token。
+- **能做什么**：工作目录限制在 `workdir_roots` 之内（先解析符号链接再判断）。默认 `permissionMode: "dontAsk"`：没有预先放行的工具调用一律拒绝，回复里会注明被拒绝的次数。要放开就在 `sdk_options` 里加 `allowedTools` 或改 `permissionMode`。群消息是不可信输入，可能被用来做 prompt 注入，权限要按需最小化。
+- **数据**：会话的完整记录留在 worker 本机（Claude Code 自己的 `~/.claude/projects`）。
 
 ## 开发
 
 ```bash
-go test -race ./...                                              # 签名、路由、去重、租约过期、会话生命周期、端到端（用假 claude）
-AGENTLINK_REAL_CLAUDE=1 go test -run TestRealClaude ./internal/worker   # 真 CLI：新建会话 + --resume，约 $0.01
+go test -race ./...    # 加密、签名、多机器人路由、去重、持久化与重启、过期、会话生命周期、端到端（测试二进制充当 SDK runner）
+AGENTLINK_REAL_CLAUDE=1 go test -run TestRealSDK ./internal/worker   # 真 Agent SDK：新建会话 + resume，约 $0.02
 ```

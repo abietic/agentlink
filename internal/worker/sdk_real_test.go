@@ -2,20 +2,23 @@ package worker
 
 import (
 	"context"
+	"encoding/json"
 	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
 )
 
-// TestRealClaude runs the installed CLI twice (a new session, then --resume) to prove the
-// flags and stdin prompt work end to end. It spends real tokens, so it only runs when
-// AGENTLINK_REAL_CLAUDE=1.
-func TestRealClaude(t *testing.T) {
+// TestRealSDK runs sdk/runner.mjs twice through the real Agent SDK (a new session under a
+// chosen id, then a resume of it) to prove the session stays the same and keeps context.
+// It spends real tokens, so it only runs when AGENTLINK_REAL_CLAUDE=1.
+func TestRealSDK(t *testing.T) {
 	if os.Getenv("AGENTLINK_REAL_CLAUDE") != "1" {
-		t.Skip("set AGENTLINK_REAL_CLAUDE=1 to run against the real claude CLI")
+		t.Skip("set AGENTLINK_REAL_CLAUDE=1 to run against the real Agent SDK")
 	}
-	c := Claude{Bin: "claude", Args: []string{"--permission-prompts", "none", "--model", "haiku"}, Timeout: 2 * time.Minute}
+	runner, _ := filepath.Abs("../../sdk/runner.mjs")
+	c := SDK{Command: []string{"node", runner}, Options: json.RawMessage(`{"permissionMode":"dontAsk","model":"haiku"}`), Timeout: 2 * time.Minute}
 	dir := t.TempDir()
 	sid := newUUID()
 	ctx := context.Background()

@@ -1,14 +1,19 @@
 {
   "server_url": "https://agentlink.example.com",
   "name": "my-laptop",
+  "bot": "",
   "allowed_users": [],
   "workdir_roots": ["~/Code"],
   "default_workdir": "~/Code",
-  "claude_bin": "claude",
-  "claude_args": [
-    "--permission-prompts", "none",
-    "--append-system-prompt", "You are answering a message from a Tanka group chat. Keep the reply short and use markdown."
-  ],
+  "runner": ["/opt/homebrew/bin/node", "/Users/me/Code/agentlink/sdk/runner.mjs"],
+  "sdk_options": {
+    "permissionMode": "dontAsk",
+    "systemPrompt": {
+      "type": "preset",
+      "preset": "claude_code",
+      "append": "You are answering a message from a Tanka group chat. Keep the reply short and use markdown."
+    }
+  },
   "timeout_sec": 1800,
   "max_concurrency": 2,
   "max_output_chars": 3500

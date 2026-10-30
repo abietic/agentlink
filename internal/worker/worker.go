@@ -1,15 +1,19 @@
-// Package worker pulls tasks for this device from agentlink-server, runs them with
-// Claude Code in the room's workdir and session, and sends the result back.
+// Package worker pulls tasks for this device from agentlink-server, runs them with the
+// Claude Agent SDK in the room's workdir and session, and sends the result back.
+//
+// Tasks and results travel sealed between this device's and the server's X25519 keys;
+// local state (identity, keys, rooms, session history) is kept encrypted in SQLite.
 package worker
 
 import (
 	"cmp"
 	"context"
+	"crypto/ecdh"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"log"
 	"net/url"
-	"path/filepath"
 	"slices"
 	"strconv"
 	"strings"
@@ -17,8 +21,8 @@ import (
 	"time"
 	"unicode/utf8"
 
-	"agentlink/internal/jsonfile"
 	"agentlink/internal/proto"
+	"agentlink/internal/seal"
 	"agentlink/internal/tanka"
 )
 
@@ -41,11 +45,14 @@ type RoomState struct {
 	Sessions  []Session `json:"sessions,omitempty"`   // most recent first
 }
 
-type State struct {
-	ServerURL   string                `json:"server_url"`
-	DeviceID    string                `json:"device_id"`
-	DeviceToken string                `json:"device_token"`
-	Rooms       map[string]*RoomState `json:"rooms"`
+// Identity is this device's registration with one server.
+type Identity struct {
+	ServerURL   string `json:"server_url"`
+	Bot         string `json:"bot"`
+	DeviceID    string `json:"device_id"`
+	DeviceToken string `json:"device_token"`
+	DeviceKey   []byte `json:"device_key"` // X25519 private key
+	ServerKey   []byte `json:"server_key"` // pinned at registration
 }
 
 type running struct {
@@ -54,60 +61,88 @@ type running struct {
 }
 
 type Worker struct {
-	cfg       Config
-	client    *Client
-	runner    Runner
-	statePath string
-	sem       chan struct{}
-	now       func() time.Time
-	wg        sync.WaitGroup
+	cfg    Config
+	client *Client
+	runner Runner
+	store  *store
+	sem    chan struct{}
+	now    func() time.Time
+	wg     sync.WaitGroup
 
-	mu      sync.Mutex
-	state   State
-	rooms   map[string]chan proto.Task
-	running map[string]running
+	mu        sync.Mutex
+	id        Identity
+	key       *ecdh.PrivateKey
+	serverKey *ecdh.PublicKey
+	state     map[string]*RoomState // by room_id
+	rooms     map[string]chan proto.Task
+	running   map[string]running
 }
 
 func New(cfg Config) (*Worker, error) {
-	w := &Worker{
-		cfg:       cfg,
-		client:    NewClient(cfg.ServerURL),
-		runner:    Claude{Bin: cfg.ClaudeBin, Args: cfg.ClaudeArgs, Timeout: cfg.timeout()},
-		statePath: filepath.Join(cfg.StateDir, "worker.state.json"),
-		sem:       make(chan struct{}, cfg.MaxConcurrency),
-		now:       time.Now,
-		rooms:     map[string]chan proto.Task{},
-		running:   map[string]running{},
-	}
-	if _, err := jsonfile.Load(w.statePath, &w.state); err != nil {
+	st, err := openStore(cfg.StateDir)
+	if err != nil {
 		return nil, err
 	}
-	if w.state.Rooms == nil {
-		w.state.Rooms = map[string]*RoomState{}
+	w := &Worker{
+		cfg:     cfg,
+		client:  NewClient(cfg.ServerURL),
+		runner:  SDK{Command: cfg.Runner, Options: cfg.SDKOptions, Timeout: cfg.timeout()},
+		store:   st,
+		sem:     make(chan struct{}, cfg.MaxConcurrency),
+		now:     time.Now,
+		rooms:   map[string]chan proto.Task{},
+		running: map[string]running{},
 	}
-	w.client.Token = w.state.DeviceToken
+	if w.state, err = st.rooms(); err != nil {
+		return nil, err
+	}
+	var id Identity
+	if _, err := st.get("identity", &id); err != nil {
+		return nil, err
+	}
+	if id.DeviceToken != "" {
+		if err := w.setIdentity(id); err != nil {
+			return nil, err
+		}
+	}
 	return w, nil
 }
 
-func (w *Worker) DeviceID() string { return w.state.DeviceID }
+func (w *Worker) setIdentity(id Identity) error {
+	key, err := seal.ParsePrivateKey(id.DeviceKey)
+	if err != nil {
+		return fmt.Errorf("device key: %w", err)
+	}
+	serverKey, err := seal.ParsePublicKey(id.ServerKey)
+	if err != nil {
+		return fmt.Errorf("server key: %w", err)
+	}
+	w.id, w.key, w.serverKey = id, key, serverKey
+	w.client.Token = id.DeviceToken
+	return nil
+}
 
-// Register gets a device id and token from the server unless this device already has one for it.
+func (w *Worker) DeviceID() string { return w.id.DeviceID }
+
+// Register gets a device id and token from the server unless this device already has one
+// for that server and bot. Each registration makes a new key pair.
 func (w *Worker) Register(ctx context.Context) error {
-	if w.state.DeviceToken != "" && w.state.ServerURL == w.client.BaseURL {
+	if w.id.DeviceToken != "" && w.id.ServerURL == w.client.BaseURL && (w.cfg.Bot == "" || w.cfg.Bot == w.id.Bot) {
 		return nil
 	}
 	if w.cfg.EnrollToken == "" {
 		return errors.New("not registered with " + w.client.BaseURL + " yet: set enroll_token (or AGENTLINK_ENROLL_TOKEN) for the first start")
 	}
-	reg, err := w.client.Register(ctx, w.cfg.EnrollToken, w.cfg.Name)
+	key := seal.NewPrivateKey()
+	reg, err := w.client.Register(ctx, w.cfg.EnrollToken, proto.RegisterRequest{Name: w.cfg.Name, Bot: w.cfg.Bot, PublicKey: key.PublicKey().Bytes()})
 	if err != nil {
 		return fmt.Errorf("register: %w", err)
 	}
-	w.mu.Lock()
-	defer w.mu.Unlock()
-	w.state.ServerURL, w.state.DeviceID, w.state.DeviceToken = w.client.BaseURL, reg.DeviceID, reg.DeviceToken
-	w.client.Token = reg.DeviceToken
-	return w.saveLocked()
+	id := Identity{ServerURL: w.client.BaseURL, Bot: reg.Bot, DeviceID: reg.DeviceID, DeviceToken: reg.DeviceToken, DeviceKey: key.Bytes(), ServerKey: reg.ServerKey}
+	if err := w.setIdentity(id); err != nil {
+		return err
+	}
+	return w.store.put("identity", id)
 }
 
 // Run polls for tasks until ctx ends, then waits for running tasks to report back.
@@ -118,8 +153,8 @@ func (w *Worker) Run(ctx context.Context) error {
 	backoff := time.Second
 	var err error
 	for ctx.Err() == nil {
-		var t *proto.Task
-		t, err = w.client.Poll(ctx)
+		var env *proto.Envelope
+		env, err = w.client.Poll(ctx)
 		if errors.Is(err, ErrUnauthorized) {
 			break
 		}
@@ -135,9 +170,19 @@ func (w *Worker) Run(ctx context.Context) error {
 			continue
 		}
 		backoff = time.Second
-		if t != nil {
-			w.dispatch(ctx, *t)
+		if env == nil {
+			continue
 		}
+		var t proto.Task
+		plain, oerr := seal.Open(w.key, w.serverKey, proto.TaskContext(w.id.DeviceID, env.ID), env.Sealed)
+		if oerr == nil {
+			oerr = json.Unmarshal(plain, &t)
+		}
+		if oerr != nil || t.ID != env.ID {
+			log.Printf("task %s: does not decrypt for this device (%v); the server will time it out", env.ID, oerr)
+			continue
+		}
+		w.dispatch(ctx, t)
 	}
 	w.wg.Wait()
 	if errors.Is(err, ErrUnauthorized) {
@@ -149,7 +194,7 @@ func (w *Worker) Run(ctx context.Context) error {
 func (w *Worker) dispatch(ctx context.Context, t proto.Task) {
 	if !slices.Contains(w.cfg.AllowedUsers, t.UserID) {
 		log.Printf("task %s: user %s is not in allowed_users", t.ID, t.UserID)
-		go w.send(t, fmt.Sprintf("User `%s` may not use device `%s`. Its owner can add that id to `allowed_users` in the worker config.", t.UserID, w.state.DeviceID))
+		go w.send(t, fmt.Sprintf("User `%s` may not use device `%s`. Its owner can add that id to `allowed_users` in the worker config.", t.UserID, w.id.DeviceID))
 		return
 	}
 	if cmd := parseCommand(t.Text); cmd.name == "status" || cmd.name == "sessions" {
@@ -206,11 +251,17 @@ func (w *Worker) roomLoop(ctx context.Context, ch chan proto.Task) {
 	}
 }
 
-// send posts a result, retrying only when the request may not have reached the server.
+// send seals and posts a result, retrying only when the request may not have reached the server.
 func (w *Worker) send(t proto.Task, text string) {
+	plain, _ := json.Marshal(proto.Result{Text: text})
+	sealed, err := seal.Seal(w.key, w.serverKey, proto.ResultContext(w.id.DeviceID, t.ID), plain)
+	if err != nil {
+		log.Printf("task %s: seal result: %v", t.ID, err)
+		return
+	}
 	for attempt := 1; ; attempt++ {
 		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-		err := w.client.Result(ctx, t.ID, text)
+		err := w.client.Result(ctx, proto.Envelope{ID: t.ID, Sealed: sealed})
 		cancel()
 		if err == nil {
 			return
@@ -253,7 +304,7 @@ func (w *Worker) handle(ctx context.Context, t proto.Task) string {
 	case "new":
 		w.mu.Lock()
 		w.roomLocked(t.RoomID).SessionID = ""
-		w.saveLocked()
+		w.saveLocked(t.RoomID)
 		w.mu.Unlock()
 		if cmd.prompt == "" {
 			return "Started a new session: the next prompt opens it."
@@ -278,7 +329,7 @@ func (w *Worker) chdir(roomID, arg string) string {
 		return "Workdir unchanged: " + err.Error()
 	}
 	rs.Workdir, rs.SessionID = dir, ""
-	w.saveLocked()
+	w.saveLocked(roomID)
 	return fmt.Sprintf("Workdir is now `%s`; the next prompt starts a new session there.", tilde(dir))
 }
 
@@ -300,7 +351,7 @@ func (w *Worker) resume(roomID, ref string) (string, bool) {
 		return "Cannot resume: " + err.Error(), false
 	}
 	rs.SessionID, rs.Workdir = s.ID, s.Workdir
-	w.saveLocked()
+	w.saveLocked(roomID)
 	return fmt.Sprintf("Resumed session `%s` in `%s`.", short(s.ID), tilde(s.Workdir)), true
 }
 
@@ -324,7 +375,7 @@ func (w *Worker) prompt(ctx context.Context, t proto.Task, text string) string {
 		rs := w.roomLocked(t.RoomID)
 		rs.SessionID = sid
 		rs.remember(Session{ID: sid, Workdir: run.Workdir, Title: preview(text, 40), LastUsed: w.now()})
-		w.saveLocked()
+		w.saveLocked(t.RoomID)
 	}
 	w.mu.Unlock()
 	log.Printf("task %s: finished in %s (error=%v)", t.ID, res.Duration.Round(time.Second), err != nil || res.IsError)
@@ -352,7 +403,7 @@ func (w *Worker) format(ctx context.Context, run Run, res RunResult, err error) 
 	if res.SessionID != "" || res.Stopped || run.Resume {
 		session = short(cmp.Or(res.SessionID, run.SessionID))
 	}
-	fmt.Fprintf(&b, "\n\n`%s` · `%s` · session `%s`", w.state.DeviceID, tilde(run.Workdir), session)
+	fmt.Fprintf(&b, "\n\n`%s` · `%s` · session `%s`", w.id.DeviceID, tilde(run.Workdir), session)
 	if res.Turns > 0 {
 		fmt.Fprintf(&b, " · %d turns", res.Turns)
 	}
@@ -382,7 +433,7 @@ func (w *Worker) query(roomID, name string) string {
 		}
 		return strings.TrimRight(b.String(), "\n")
 	}
-	fmt.Fprintf(&b, "- **Device** `%s` (%s)\n", w.state.DeviceID, w.cfg.Name)
+	fmt.Fprintf(&b, "- **Device** `%s` (%s)\n", w.id.DeviceID, w.cfg.Name)
 	fmt.Fprintf(&b, "- **Workdir** `%s`\n", tilde(rs.Workdir))
 	if rs.SessionID == "" {
 		b.WriteString("- **Session** none yet: the next prompt starts one\n")
@@ -401,20 +452,18 @@ func (w *Worker) query(roomID, name string) string {
 }
 
 func (w *Worker) roomLocked(roomID string) *RoomState {
-	rs := w.state.Rooms[roomID]
+	rs := w.state[roomID]
 	if rs == nil {
 		rs = &RoomState{Workdir: w.cfg.DefaultWorkdir}
-		w.state.Rooms[roomID] = rs
+		w.state[roomID] = rs
 	}
 	return rs
 }
 
-func (w *Worker) saveLocked() error {
-	err := jsonfile.Save(w.statePath, &w.state)
-	if err != nil {
-		log.Printf("save worker state: %v", err)
+func (w *Worker) saveLocked(roomID string) {
+	if err := w.store.put("room/"+roomID, w.state[roomID]); err != nil {
+		log.Printf("save room %s: %v", roomID, err)
 	}
-	return err
 }
 
 // remember moves s to the front of the history, keeping the title it first got.

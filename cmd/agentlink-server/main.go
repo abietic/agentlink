@@ -27,6 +27,7 @@ func main() {
 	if err != nil {
 		log.Fatal(err)
 	}
+	defer s.Close()
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 	go s.Reap(ctx)
@@ -46,6 +47,6 @@ func main() {
 	}()
 	log.Printf("agentlink-server listening on %s", cfg.Listen)
 	if err := srv.ListenAndServe(); !errors.Is(err, http.ErrServerClosed) {
-		log.Fatal(err)
+		log.Fatal(err) // SQLite recovers from the unclosed database on the next start
 	}
 }

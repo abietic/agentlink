@@ -1,11 +1,20 @@
 {
-  "listen": ":8080",
-  "state_path": "/var/lib/agentlink/server.state.json",
+  "listen": "127.0.0.1:8080",
+  "db_path": "/var/lib/agentlink/server.db",
+  "key_path": "/var/lib/agentlink/server.key",
+  "bots": [
+    {
+      "name": "agentlink",
+      "app_id": "",
+      "mentions": ["Agent Link"],
+      "room_webhooks": {}
+    }
+  ],
+  "default_bot": "agentlink",
   "allowed_users": [],
-  "bot_names": ["Agent Link"],
-  "room_webhooks": {},
   "response_url_prefix": "https://api.tanka.ai/",
   "poll_wait_sec": 25,
   "lease_sec": 2400,
+  "queue_ttl_sec": 600,
   "max_reply_chars": 8000
 }

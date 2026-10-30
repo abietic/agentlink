@@ -1,4 +1,7 @@
 /agentlink-server
 /agentlink-worker
 /bin/
-*.state.json
+*.db
+*.db-*
+*.key
+/sdk/node_modules/
