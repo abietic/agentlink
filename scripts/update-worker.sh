@@ -22,7 +22,7 @@ trap 'rm -rf "$tmp"' EXIT
 gh release download "$tag" --repo "$REPO" --dir "$tmp" -p "$asset" -p agentlink-sdk.tar.gz -p SHA256SUMS
 (cd "$tmp" && shasum -a 256 -c --ignore-missing --quiet SHA256SUMS)
 for f in "$asset" agentlink-sdk.tar.gz; do
-  gh attestation verify "$tmp/$f" --repo "$REPO" >/dev/null
+  gh attestation verify "$tmp/$f" --repo "$REPO" --signer-workflow "$REPO/.github/workflows/release.yml" --source-ref "refs/tags/$tag" >/dev/null
 done
 mkdir "$tmp/sdk"
 tar -xzf "$tmp/agentlink-sdk.tar.gz" -C "$tmp/sdk" --strip-components 1
