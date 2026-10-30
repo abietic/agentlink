@@ -49,6 +49,12 @@ func (c *Client) Result(ctx context.Context, env proto.Envelope) error {
 	return err
 }
 
+// Trigger asks the server to queue a task for this device in a room it serves.
+func (c *Client) Trigger(ctx context.Context, req proto.TriggerRequest) error {
+	_, err := c.do(ctx, http.MethodPost, "/api/v1/trigger", c.Token, req, nil)
+	return err
+}
+
 func (c *Client) do(ctx context.Context, method, path, token string, in, out any) (int, error) {
 	var body io.Reader
 	if in != nil {

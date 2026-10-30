@@ -76,6 +76,7 @@ type Worker struct {
 	state     map[string]*RoomState // by room_id
 	rooms     map[string]chan proto.Task
 	running   map[string]running
+	marks     map[string]time.Time // trigger dedupe: "seen/<trigger>/<key>" and "ran/<trigger>/<key>"
 }
 
 func New(cfg Config) (*Worker, error) {
@@ -92,8 +93,12 @@ func New(cfg Config) (*Worker, error) {
 		now:     time.Now,
 		rooms:   map[string]chan proto.Task{},
 		running: map[string]running{},
+		marks:   map[string]time.Time{},
 	}
 	if w.state, err = st.rooms(); err != nil {
+		return nil, err
+	}
+	if _, err := st.get("marks", &w.marks); err != nil {
 		return nil, err
 	}
 	var id Identity
@@ -150,6 +155,12 @@ func (w *Worker) Run(ctx context.Context) error {
 	if len(w.cfg.AllowedUsers) == 0 {
 		log.Printf("allowed_users is empty: every task is refused, and the reply shows the sender's id")
 	}
+	for _, tr := range w.cfg.Triggers {
+		if len(tr.Command) > 0 {
+			w.wg.Add(1)
+			go w.watch(ctx, tr)
+		}
+	}
 	backoff := time.Second
 	var err error
 	for ctx.Err() == nil {
@@ -192,12 +203,17 @@ func (w *Worker) Run(ctx context.Context) error {
 }
 
 func (w *Worker) dispatch(ctx context.Context, t proto.Task) {
-	if !slices.Contains(w.cfg.AllowedUsers, t.UserID) {
+	if t.Trigger != "" {
+		if err := w.admit(t); err != nil {
+			log.Printf("task %s: trigger %s not run: %v", t.ID, t.Trigger, err)
+			go w.send(t, "") // posts nothing
+			return
+		}
+	} else if !slices.Contains(w.cfg.AllowedUsers, t.UserID) {
 		log.Printf("task %s: user %s is not in allowed_users", t.ID, t.UserID)
 		go w.send(t, fmt.Sprintf("User `%s` may not use device `%s`. Its owner can add that id to `allowed_users` in the worker config.", t.UserID, w.id.DeviceID))
 		return
-	}
-	if cmd := parseCommand(t.Text); cmd.name == "status" || cmd.name == "sessions" {
+	} else if cmd := parseCommand(t.Text); cmd.name == "status" || cmd.name == "sessions" {
 		go w.send(t, w.query(t.RoomID, cmd.name)) // read-only, so it answers even while a prompt runs
 		return
 	}
@@ -297,6 +313,14 @@ func parseCommand(text string) command {
 
 // handle runs a task that may change room state or start Claude; it returns the reply.
 func (w *Worker) handle(ctx context.Context, t proto.Task) string {
+	if tr := w.trigger(t.Trigger); tr != nil { // the text is a prompt, never a room command
+		w.mu.Lock()
+		rs := w.roomLocked(t.RoomID)
+		rs.Workdir, rs.SessionID = tr.Workdir, ""
+		w.saveLocked(t.RoomID)
+		w.mu.Unlock()
+		return w.prompt(ctx, t, t.Text)
+	}
 	cmd := parseCommand(t.Text)
 	switch cmd.name {
 	case "cd":

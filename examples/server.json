@@ -7,7 +7,8 @@
       "name": "agentlink",
       "app_id": "",
       "mentions": ["Agent Link"],
-      "room_webhooks": {}
+      "room_webhooks": {},
+      "rooms": {}
     }
   ],
   "default_bot": "agentlink",

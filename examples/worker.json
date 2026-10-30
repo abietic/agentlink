@@ -16,5 +16,6 @@
   },
   "timeout_sec": 1800,
   "max_concurrency": 2,
-  "max_output_chars": 3500
+  "max_output_chars": 3500,
+  "triggers": []
 }

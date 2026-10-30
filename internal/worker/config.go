@@ -37,6 +37,8 @@ type Config struct {
 	TimeoutSec     int             `json:"timeout_sec"`      // per run; default 1800, keep below the server's lease_sec
 	MaxConcurrency int             `json:"max_concurrency"`  // runs at once across rooms; default 2
 	MaxOutputChars int             `json:"max_output_chars"` // reply body cap; default 3500
+
+	Triggers []Trigger `json:"triggers"` // see Trigger
 }
 
 func LoadConfig(path string) (Config, error) {
@@ -95,7 +97,7 @@ func (c *Config) applyDefaults() error {
 	if c.MaxOutputChars <= 0 {
 		c.MaxOutputChars = 3500
 	}
-	return nil
+	return c.checkTriggers()
 }
 
 func (c Config) timeout() time.Duration { return time.Duration(c.TimeoutSec) * time.Second }

@@ -1,8 +1,10 @@
 package server
 
 import (
+	"encoding/json"
 	"errors"
 	"fmt"
+	"maps"
 	"os"
 	"regexp"
 	"strings"
@@ -23,8 +25,14 @@ type Bot struct {
 	// Mentions are the bot's display names, so "@Name with spaces" is stripped whole.
 	Mentions []string `json:"mentions"`
 	// RoomWebhooks maps room_id to an incoming-webhook URL, used when response_url is
-	// missing, expired or already used.
+	// missing, expired or already used, and for triggered tasks, which have none. Webhook
+	// URLs are credentials: AGENTLINK_ROOM_WEBHOOKS_<NAME>, a JSON object, adds to them.
 	RoomWebhooks map[string]string `json:"room_webhooks"`
+	// Rooms binds room_id to device_id at startup, as `pair` from that room would, so a
+	// room can be bound without posting in it.
+	Rooms map[string]string `json:"rooms"`
+	// Sentry, when set, takes Sentry integration webhooks at POST /sentry/{name}.
+	Sentry *SentryHook `json:"sentry"`
 }
 
 // Config is the server's JSON config. AGENTLINK_ENROLL_TOKEN overrides enroll_token.
@@ -64,15 +72,30 @@ func LoadConfig(path string) (Config, error) {
 		c.EnrollToken = v
 	}
 	for i := range c.Bots {
-		if v := os.Getenv(secretEnv(c.Bots[i].Name)); v != "" {
-			c.Bots[i].SigningSecret = v
+		b := &c.Bots[i]
+		if v := os.Getenv(botEnv("AGENTLINK_SIGNING_SECRET_", b.Name)); v != "" {
+			b.SigningSecret = v
+		}
+		if v := os.Getenv(botEnv("AGENTLINK_SENTRY_SECRET_", b.Name)); v != "" && b.Sentry != nil {
+			b.Sentry.ClientSecret = v
+		}
+		if v := os.Getenv(botEnv("AGENTLINK_ROOM_WEBHOOKS_", b.Name)); v != "" {
+			var hooks map[string]string
+			if err := json.Unmarshal([]byte(v), &hooks); err != nil {
+				return c, fmt.Errorf("%s: %w", botEnv("AGENTLINK_ROOM_WEBHOOKS_", b.Name), err)
+			}
+			if b.RoomWebhooks == nil {
+				b.RoomWebhooks = map[string]string{}
+			}
+			maps.Copy(b.RoomWebhooks, hooks)
 		}
 	}
 	return c, c.check()
 }
 
-func secretEnv(bot string) string {
-	return "AGENTLINK_SIGNING_SECRET_" + strings.ToUpper(strings.ReplaceAll(bot, "-", "_"))
+// botEnv names a per-bot environment variable: prefix + the bot name upper-cased, "-" as "_".
+func botEnv(prefix, bot string) string {
+	return prefix + strings.ToUpper(strings.ReplaceAll(bot, "-", "_"))
 }
 
 func (c *Config) check() error {
@@ -91,7 +114,23 @@ func (c *Config) check() error {
 		case seen[b.Name]:
 			return fmt.Errorf("bot %q is listed twice", b.Name)
 		case b.SigningSecret == "":
-			return fmt.Errorf("bot %q: signing_secret (or %s) is required", b.Name, secretEnv(b.Name))
+			return fmt.Errorf("bot %q: signing_secret (or %s) is required", b.Name, botEnv("AGENTLINK_SIGNING_SECRET_", b.Name))
+		}
+		for room, dev := range b.Rooms {
+			if room == "" || dev == "" {
+				return fmt.Errorf("bot %q: rooms needs a room id and a device id in each entry", b.Name)
+			}
+		}
+		if h := b.Sentry; h != nil {
+			switch {
+			case h.ClientSecret == "":
+				return fmt.Errorf("bot %q: sentry.client_secret (or %s) is required", b.Name, botEnv("AGENTLINK_SENTRY_SECRET_", b.Name))
+			case h.RoomID == "" || h.Prompt == "":
+				return fmt.Errorf("bot %q: sentry needs room_id and prompt", b.Name)
+			}
+			if h.Trigger == "" {
+				h.Trigger = "sentry"
+			}
 		}
 		seen[b.Name] = true
 	}

@@ -1,5 +1,7 @@
 // Package server receives Tanka app_mention events for one or more bots, queues each one
-// for the worker device paired with its room, and posts the worker's result back.
+// for the worker device paired with its room, and posts the worker's result back. Tasks
+// can also be triggered without a mention, by a worker (POST /api/v1/trigger) or by a
+// Sentry integration (POST /sentry/{bot}); their results go to the room's webhook.
 //
 // State lives in SQLite. A task's content is sealed to its device's key as soon as it
 // arrives, so the database and everything between server and worker (the TLS-terminating
@@ -134,6 +136,14 @@ func New(cfg Config) (*Server, error) {
 		db.Close()
 		return nil, err
 	}
+	for _, b := range s.cfg.Bots {
+		for room, dev := range b.Rooms {
+			if err := s.bind(b.Name, room, dev, "", "config"); err != nil {
+				db.Close()
+				return nil, fmt.Errorf("bot %s room %s: %w", b.Name, room, err)
+			}
+		}
+	}
 	return s, nil
 }
 
@@ -167,6 +177,8 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("POST /api/v1/register", s.handleRegister)
 	mux.HandleFunc("GET /api/v1/poll", s.handlePoll)
 	mux.HandleFunc("POST /api/v1/tasks/{id}/result", s.handleResult)
+	mux.HandleFunc("POST /api/v1/trigger", s.handleTrigger)
+	mux.HandleFunc("POST /sentry/{bot}", s.handleSentry)
 	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, _ *http.Request) { io.WriteString(w, "ok\n") })
 	return mux
 }
@@ -296,16 +308,20 @@ func (s *Server) pair(bot *Bot, ev tanka.MentionEvent, deviceID string) string {
 	case d.Bot != bot.Name:
 		return fmt.Sprintf("Device `%s` is set up for bot `%s`; mention that bot in this room to pair it.", deviceID, d.Bot)
 	}
-	_, err = s.db.Exec(`INSERT INTO bindings (bot, room_id, device_id, room_name, bound_by, bound_at) VALUES (?, ?, ?, ?, ?, ?)
-		ON CONFLICT (bot, room_id) DO UPDATE SET device_id = excluded.device_id, room_name = excluded.room_name,
-			bound_by = excluded.bound_by, bound_at = excluded.bound_at`,
-		bot.Name, ev.RoomID, deviceID, ev.RoomName, ev.UserID, s.now().UnixMilli())
-	if err != nil {
+	if err := s.bind(bot.Name, ev.RoomID, deviceID, ev.RoomName, ev.UserID); err != nil {
 		log.Printf("pair: %v", err)
 		return "Pairing failed: the server could not save it."
 	}
 	log.Printf("bot %s room %s paired with device %s by %s", bot.Name, ev.RoomID, deviceID, ev.UserID)
 	return fmt.Sprintf("Paired this room with device `%s` (%s). Mention me with a prompt to run it there.", deviceID, d.Name)
+}
+
+func (s *Server) bind(bot, roomID, deviceID, roomName, by string) error {
+	_, err := s.db.Exec(`INSERT INTO bindings (bot, room_id, device_id, room_name, bound_by, bound_at) VALUES (?, ?, ?, ?, ?, ?)
+		ON CONFLICT (bot, room_id) DO UPDATE SET device_id = excluded.device_id, room_name = excluded.room_name,
+			bound_by = excluded.bound_by, bound_at = excluded.bound_at`,
+		bot, roomID, deviceID, roomName, by, s.now().UnixMilli())
+	return err
 }
 
 func (s *Server) unpair(bot *Bot, roomID string) string {
@@ -341,7 +357,9 @@ func (s *Server) enqueue(bot *Bot, ev tanka.MentionEvent, text string) {
 	case queued >= maxQueuePerDev:
 		msg = fmt.Sprintf("Device `%s` already has %d tasks waiting; try again later.", d.ID, maxQueuePerDev)
 	default:
-		id, err := s.insertTask(bot, d, ev, text)
+		id, err := s.insertTask(bot, d, proto.Task{
+			RoomID: ev.RoomID, RoomName: ev.RoomName, UserID: ev.UserID, UserName: ev.UserName, Text: text,
+		}, ev.ResponseURL)
 		if err == nil {
 			log.Printf("task %s queued bot=%s room=%s user=%s device=%s", id, bot.Name, ev.RoomID, ev.UserID, d.ID)
 			return
@@ -352,12 +370,11 @@ func (s *Server) enqueue(bot *Bot, ev tanka.MentionEvent, text string) {
 	s.replyAsync(bot, ev.RoomID, ev.ResponseURL, msg)
 }
 
-func (s *Server) insertTask(bot *Bot, d *device, ev tanka.MentionEvent, text string) (string, error) {
+// insertTask fills in t's id and time, seals it to d and queues it; responseURL may be empty.
+func (s *Server) insertTask(bot *Bot, d *device, t proto.Task, responseURL string) (string, error) {
 	id := "t-" + randHex(6)
-	plain, err := json.Marshal(proto.Task{
-		ID: id, RoomID: ev.RoomID, RoomName: ev.RoomName,
-		UserID: ev.UserID, UserName: ev.UserName, Text: text, CreatedAt: s.now(),
-	})
+	t.ID, t.CreatedAt = id, s.now()
+	plain, err := json.Marshal(t)
 	if err != nil {
 		return "", err
 	}
@@ -365,17 +382,74 @@ func (s *Server) insertTask(bot *Bot, d *device, ev tanka.MentionEvent, text str
 	if err != nil {
 		return "", err
 	}
-	replyTo, err := seal.Box(s.key, "reply "+id, []byte(ev.ResponseURL))
+	replyTo, err := seal.Box(s.key, "reply "+id, []byte(responseURL))
 	if err != nil {
 		return "", err
 	}
 	_, err = s.db.Exec(`INSERT INTO tasks (id, device_id, bot, room_id, payload, reply_to, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)`,
-		id, d.ID, bot.Name, ev.RoomID, payload, replyTo, s.now().UnixMilli())
+		id, d.ID, bot.Name, t.RoomID, payload, replyTo, s.now().UnixMilli())
 	if err != nil {
 		return "", err
 	}
 	s.signal(d.ID)
 	return id, nil
+}
+
+// trigger queues a task nobody typed for the device bound to roomID. It is queued even if
+// the device is offline; if nobody picks it up, it expires without a reply.
+func (s *Server) trigger(bot *Bot, roomID, name, key, text string) (string, error) {
+	d, err := s.deviceWhere(`id = (SELECT device_id FROM bindings WHERE bot = ? AND room_id = ?)`, bot.Name, roomID)
+	if errors.Is(err, sql.ErrNoRows) {
+		return "", errors.New("room is not bound to a registered device")
+	}
+	if err != nil {
+		return "", err
+	}
+	var queued int
+	if err := s.db.QueryRow(`SELECT count(*) FROM tasks WHERE device_id = ?`, d.ID).Scan(&queued); err != nil {
+		return "", err
+	}
+	if queued >= maxQueuePerDev {
+		return "", fmt.Errorf("device %s already has %d tasks waiting", d.ID, queued)
+	}
+	return s.insertTask(bot, d, proto.Task{RoomID: roomID, Text: text, Trigger: name, Key: key}, "")
+}
+
+// handleTrigger queues a task a worker's trigger produced. The body is sealed by the
+// device, and the room must belong to the device's own bot.
+func (s *Server) handleTrigger(w http.ResponseWriter, r *http.Request) {
+	d, ok := s.auth(r)
+	if !ok {
+		http.Error(w, "unauthorized", http.StatusUnauthorized)
+		return
+	}
+	var req proto.TriggerRequest
+	if err := json.NewDecoder(io.LimitReader(r.Body, maxBody)).Decode(&req); err != nil || req.RoomID == "" {
+		http.Error(w, "bad json", http.StatusBadRequest)
+		return
+	}
+	var body proto.TriggerBody
+	plain, err := seal.Open(s.priv, d.Pub, proto.TriggerContext(d.ID, req.RoomID), req.Sealed)
+	if err == nil {
+		err = json.Unmarshal(plain, &body)
+	}
+	if err != nil || body.Trigger == "" || strings.TrimSpace(body.Text) == "" {
+		http.Error(w, "trigger does not decrypt for this device and room, or is incomplete", http.StatusBadRequest)
+		return
+	}
+	bot := s.bots[d.Bot]
+	if bot == nil {
+		http.Error(w, "the device's bot is no longer configured", http.StatusConflict)
+		return
+	}
+	id, err := s.trigger(bot, req.RoomID, body.Trigger, body.Key, body.Text)
+	if err != nil {
+		log.Printf("trigger from %s for room %s: %v", d.ID, req.RoomID, err)
+		http.Error(w, "not queued: "+err.Error(), http.StatusConflict)
+		return
+	}
+	log.Printf("task %s queued bot=%s room=%s trigger=%s from=%s", id, d.Bot, req.RoomID, body.Trigger, d.ID)
+	writeJSON(w, http.StatusOK, map[string]string{"id": id})
 }
 
 func (s *Server) online(d *device) bool {
@@ -527,6 +601,11 @@ func (s *Server) handleResult(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "storage error", http.StatusInternalServerError)
 		return
 	}
+	if res.Text == "" {
+		log.Printf("task %s done room=%s (nothing to post)", id, room)
+		writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
+		return
+	}
 	if err := s.reply(s.bots[botName], room, s.responseURL(id, replyTo), res.Text); err != nil {
 		log.Printf("task %s: reply failed: %v", id, err)
 		http.Error(w, "reply failed", http.StatusBadGateway)
@@ -566,8 +645,12 @@ func (s *Server) reapExpired(now time.Time) {
 			msg = fmt.Sprintf("Device `%s` took this task but sent no result within %s, so it was dropped.", d.dev, s.cfg.lease())
 		}
 		log.Printf("task %s expired on device %s", d.id, d.dev)
-		if bot := s.bots[d.bot]; bot != nil {
-			s.replyAsync(bot, d.room, s.responseURL(d.id, d.replyTo), msg)
+		// Only a mention gets told: a triggered task has no response_url, and an asleep
+		// laptop would otherwise fill the room with notices.
+		if u := s.responseURL(d.id, d.replyTo); u != "" {
+			if bot := s.bots[d.bot]; bot != nil {
+				s.replyAsync(bot, d.room, u, msg)
+			}
 		}
 	}
 	if _, err := s.db.Exec(`DELETE FROM events WHERE seen_at < ?`, now.Add(-dedupeTTL).UnixMilli()); err != nil {
