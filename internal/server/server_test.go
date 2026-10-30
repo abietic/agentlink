@@ -421,3 +421,14 @@ func TestStripMention(t *testing.T) {
 		}
 	}
 }
+
+func TestShape(t *testing.T) {
+	var v any
+	if err := json.Unmarshal([]byte(`{"type":"event_callback","event":{"text":"secret words","refs":[{"url":"https://x/y","w":240}],"n":null,"ok":true,"tags":[]}}`), &v); err != nil {
+		t.Fatal(err)
+	}
+	want := "{event:{n:null,ok:bool,refs:[{url:string,w:number}]x1,tags:[],text:string},type:string}"
+	if got := shape(v); got != want {
+		t.Fatalf("shape = %s\nwant    %s", got, want)
+	}
+}

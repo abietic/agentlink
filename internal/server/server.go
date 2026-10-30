@@ -24,6 +24,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"maps"
 	"net/http"
 	"slices"
 	"strings"
@@ -229,6 +230,11 @@ func (s *Server) handleEvent(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "wrong app", http.StatusForbidden)
 		return
 	}
+	if env.Type == "event_callback" {
+		var raw any
+		_ = json.Unmarshal(body, &raw)
+		log.Printf("bot %s: event %s shape %q", bot.Name, env.EventID, shape(raw))
+	}
 	if env.Type == "event_callback" && env.Event != nil && env.Event.Type == "app_mention" {
 		first, err := s.firstSeen(bot.Name + "/" + env.EventID)
 		if err != nil {
@@ -241,6 +247,33 @@ func (s *Server) handleEvent(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	writeJSON(w, http.StatusOK, map[string]int{"code": 0})
+}
+
+// shape renders the keys and value types of a decoded JSON value without any values, so the
+// log shows every field Tanka sends (documented or not) without the message text in it.
+func shape(v any) string {
+	switch v := v.(type) {
+	case map[string]any:
+		parts := make([]string, 0, len(v))
+		for _, k := range slices.Sorted(maps.Keys(v)) {
+			parts = append(parts, k+":"+shape(v[k]))
+		}
+		return "{" + strings.Join(parts, ",") + "}"
+	case []any:
+		if len(v) == 0 {
+			return "[]"
+		}
+		return fmt.Sprintf("[%s]x%d", shape(v[0]), len(v))
+	case string:
+		return "string"
+	case float64:
+		return "number"
+	case bool:
+		return "bool"
+	case nil:
+		return "null"
+	}
+	return "?"
 }
 
 func (s *Server) firstSeen(key string) (bool, error) {
