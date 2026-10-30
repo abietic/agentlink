@@ -1,6 +1,7 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<!-- Keeps agentlink-worker running as a user LaunchAgent. Replace USER, then:
+<!-- Keeps agentlink-worker running as a user LaunchAgent (restarted if it exits). Replace USER, then:
+     install -m 0755 bin/agentlink-worker ~/.agentlink/bin/agentlink-worker
      cp examples/com.agentlink.worker.plist ~/Library/LaunchAgents/
      launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.agentlink.worker.plist -->
 <plist version="1.0">
@@ -9,7 +10,7 @@
   <string>com.agentlink.worker</string>
   <key>ProgramArguments</key>
   <array>
-    <string>/Users/USER/go/bin/agentlink-worker</string>
+    <string>/Users/USER/.agentlink/bin/agentlink-worker</string>
   </array>
   <key>EnvironmentVariables</key>
   <dict>
@@ -21,6 +22,10 @@
   <true/>
   <key>KeepAlive</key>
   <true/>
+  <key>ThrottleInterval</key>
+  <integer>10</integer>
+  <key>StandardOutPath</key>
+  <string>/Users/USER/.agentlink/worker.log</string>
   <key>StandardErrorPath</key>
   <string>/Users/USER/.agentlink/worker.log</string>
 </dict>

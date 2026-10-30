@@ -80,7 +80,7 @@ AGENTLINK_ENROLL_TOKEN=... agentlink-worker
 
 - **入口**：每个事件都要通过对应机器人的 HMAC 签名校验（±5 分钟）；配了 `app_id` 的机器人还要求 `api_app_id` 一致；`event_id` 去重（持久化，重启后也不会重复执行）；`response_url` 只接受 `response_url_prefix` 开头的地址。
 - **谁能驱动机器**：server 的 `allowed_users` 是可选的粗过滤；最终由 worker 本机的 `allowed_users` 决定，默认拒绝所有人。设备注册需要 enroll token。
-- **能做什么**：工作目录限制在 `workdir_roots` 之内（先解析符号链接再判断）。默认 `permissionMode: "dontAsk"`：没有预先放行的工具调用一律拒绝，回复里会注明被拒绝的次数。要放开就在 `sdk_options` 里加 `allowedTools` 或改 `permissionMode`。群消息是不可信输入，可能被用来做 prompt 注入，权限要按需最小化。
+- **能做什么**：工作目录限制在 `workdir_roots` 之内（先解析符号链接再判断）。默认 `permissionMode: "auto"`：由模型分类器逐个批准或拒绝工具调用，判断不了的一律拒绝（没人在场回答权限询问），回复里会注明被拒绝的次数。要更严就改成 `"dontAsk"` 并用 `allowedTools` 预先放行，要更松就在 `allowedTools` 里加。群消息是不可信输入，可能被用来做 prompt 注入；分类器能挡住一部分，但不等于沙箱，`allowed_users` 要保持最小。
 - **数据**：会话的完整记录留在 worker 本机（Claude Code 自己的 `~/.claude/projects`）。
 
 ## 开发

@@ -137,7 +137,7 @@ func TestSessionLifecycle(t *testing.T) {
 		t.Fatalf("first reply: %q", reply)
 	}
 	first := f.last(t).SessionID
-	if !isUUID(first) || f.last(t).Resume || string(f.last(t).Options) != `{"permissionMode":"dontAsk"}` {
+	if !isUUID(first) || f.last(t).Resume || string(f.last(t).Options) != `{"permissionMode":"auto"}` {
 		t.Fatalf("first run: %+v", f.last(t))
 	}
 

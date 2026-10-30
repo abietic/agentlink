@@ -7,7 +7,7 @@
   "default_workdir": "~/Code",
   "runner": ["/opt/homebrew/bin/node", "/Users/me/Code/agentlink/sdk/runner.mjs"],
   "sdk_options": {
-    "permissionMode": "dontAsk",
+    "permissionMode": "auto",
     "systemPrompt": {
       "type": "preset",
       "preset": "claude_code",

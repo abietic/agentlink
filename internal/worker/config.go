@@ -31,8 +31,8 @@ type Config struct {
 	// ["node", "<repo>/sdk/runner.mjs"] after `npm ci` in sdk/.
 	Runner []string `json:"runner"`
 	// SDKOptions go to the SDK's query() as options; cwd and the session are set per run.
-	// Default {"permissionMode": "dontAsk"}: tool calls that are not pre-approved are
-	// denied, since nobody is there to answer a permission prompt.
+	// Default {"permissionMode": "auto"}: a model classifier approves or denies each tool
+	// call; a call it cannot decide is denied, since nobody is there to answer a prompt.
 	SDKOptions     json.RawMessage `json:"sdk_options"`
 	TimeoutSec     int             `json:"timeout_sec"`      // per run; default 1800, keep below the server's lease_sec
 	MaxConcurrency int             `json:"max_concurrency"`  // runs at once across rooms; default 2
@@ -84,7 +84,7 @@ func (c *Config) applyDefaults() error {
 	}
 	c.DefaultWorkdir = dir
 	if c.SDKOptions == nil {
-		c.SDKOptions = json.RawMessage(`{"permissionMode":"dontAsk"}`)
+		c.SDKOptions = json.RawMessage(`{"permissionMode":"auto"}`)
 	}
 	if c.TimeoutSec <= 0 {
 		c.TimeoutSec = 1800
