@@ -69,7 +69,7 @@ func TestTriggeredTask(t *testing.T) {
 	if err := w.admit(alert); err != nil {
 		t.Fatal(err)
 	}
-	if reply := w.handle(ctx, alert); !strings.Contains(reply, "echo: cd / and look @ "+sub) {
+	if reply := w.handle(ctx, alert); !strings.Contains(reply, "echo: cd / and look @ "+sub) || strings.Contains(reply, "`"+tilde(sub)+"` · session") {
 		t.Fatalf("triggered reply: %q", reply)
 	}
 	triggered := f.last(t)

@@ -403,10 +403,10 @@ func (w *Worker) prompt(ctx context.Context, t proto.Task, text string) string {
 	}
 	w.mu.Unlock()
 	log.Printf("task %s: finished in %s (error=%v)", t.ID, res.Duration.Round(time.Second), err != nil || res.IsError)
-	return w.format(ctx, run, res, err)
+	return w.format(ctx, t, run, res, err)
 }
 
-func (w *Worker) format(ctx context.Context, run Run, res RunResult, err error) string {
+func (w *Worker) format(ctx context.Context, t proto.Task, run Run, res RunResult, err error) string {
 	var b strings.Builder
 	switch {
 	case res.Stopped && ctx.Err() != nil:
@@ -427,7 +427,11 @@ func (w *Worker) format(ctx context.Context, run Run, res RunResult, err error) 
 	if res.SessionID != "" || res.Stopped || run.Resume {
 		session = short(cmp.Or(res.SessionID, run.SessionID))
 	}
-	fmt.Fprintf(&b, "\n\n`%s` · `%s` · session `%s`", w.id.DeviceID, tilde(run.Workdir), session)
+	b.WriteString("\n\n")
+	if t.Trigger == "" { // a trigger's room may be wider than the people who drive this device
+		fmt.Fprintf(&b, "`%s` · `%s` · ", w.id.DeviceID, tilde(run.Workdir))
+	}
+	fmt.Fprintf(&b, "session `%s`", session)
 	if res.Turns > 0 {
 		fmt.Fprintf(&b, " · %d turns", res.Turns)
 	}
