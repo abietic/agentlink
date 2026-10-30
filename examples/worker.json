@@ -5,7 +5,7 @@
   "allowed_users": [],
   "workdir_roots": ["~/Code"],
   "default_workdir": "~/Code",
-  "runner": ["/opt/homebrew/bin/node", "/Users/me/Code/agentlink/sdk/runner.mjs"],
+  "runner": ["/opt/homebrew/bin/node", "/Users/me/.agentlink/sdk/runner.mjs"],
   "sdk_options": {
     "permissionMode": "auto",
     "systemPrompt": {

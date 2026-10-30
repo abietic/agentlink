@@ -1,0 +1,28 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!-- Hourly worker update from the latest GitHub release (scripts/update-worker.sh).
+     Install: cp scripts/update-worker.sh ~/.agentlink/bin/ && sed "s/USER/$USER/g" examples/com.agentlink.update.plist > ~/Library/LaunchAgents/com.agentlink.update.plist && launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.agentlink.update.plist -->
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.agentlink.update</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/bin/bash</string>
+    <string>/Users/USER/.agentlink/bin/update-worker.sh</string>
+  </array>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>PATH</key>
+    <string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+  </dict>
+  <key>StartInterval</key>
+  <integer>3600</integer>
+  <key>RunAtLoad</key>
+  <true/>
+  <key>StandardOutPath</key>
+  <string>/Users/USER/.agentlink/update.log</string>
+  <key>StandardErrorPath</key>
+  <string>/Users/USER/.agentlink/update.log</string>
+</dict>
+</plist>

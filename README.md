@@ -92,6 +92,12 @@ AGENTLINK_ENROLL_TOKEN=... agentlink-worker
 3. 发一条 prompt。如果 `allowed_users` 是空的，回复会写出你的 Tanka user id；填进 `allowed_users` 后重启 worker。
 4. 常驻见 `examples/com.agentlink.worker.plist`（launchd）。
 
+## 发布与自动更新
+
+- 推 `v*` tag 触发 `.github/workflows/release.yml`：跑测试，构建 server（Linux amd64 / arm64）、worker（macOS arm64 / amd64）和 SDK runner 包，生成 `SHA256SUMS`，用 GitHub artifact attestation 记录构建来源，发成 Release。日常 push 和 PR 由 `ci.yml` 跑 gofmt、vet 和 `go test -race`。
+- **server**：把 `scripts/update-server.sh` 放到 `/opt/agentlink/`，装上 `examples/agentlink-update.service` 和 `.timer`（`AGENTLINK_HEALTH` 改成 server 的监听地址）。每小时检查一次：有新版本就下载、校验 sha256、替换、重启 `agentlink-server`；`/healthz` 20 秒内不通就换回旧版本，之后不再重试这个版本。只动 agentlink 自己的单元。
+- **worker**：把 `scripts/update-worker.sh` 放到 `~/.agentlink/bin/`，装上 `examples/com.agentlink.update.plist`。每小时检查一次：下载 worker 和 SDK runner，校验 sha256 并用 `gh attestation verify` 确认是本仓库的 release 流水线构建的（需要已登录的 `gh`），在 `~/.agentlink/sdk` 里 `npm ci`，等没有正在跑的 prompt 时替换并重启 worker。用自动更新时，`runner` 指向 `~/.agentlink/sdk/runner.mjs`。
+
 ## 安全模型
 
 - **入口**：每个事件都要通过对应机器人的 HMAC 签名校验（±5 分钟）；配了 `app_id` 的机器人还要求 `api_app_id` 一致；`event_id` 去重（持久化，重启后也不会重复执行）；`response_url` 只接受 `response_url_prefix` 开头的地址。

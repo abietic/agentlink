@@ -1,0 +1,37 @@
+# A v* tag builds the server (Linux) and worker (macOS) binaries plus the SDK runner,
+# attests their build provenance, and publishes them as a release. The updaters in
+# scripts/ install from the latest release.
+name: release
+on:
+  push:
+    tags: ['v*']
+permissions:
+  contents: write
+  id-token: write
+  attestations: write
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+      - run: go test -race ./...
+      - name: Build
+        run: |
+          set -euo pipefail
+          mkdir dist
+          build() { CGO_ENABLED=0 GOOS=$1 GOARCH=$2 go build -trimpath -ldflags "-s -w" -o "dist/$3-$1-$2" "./cmd/$3"; }
+          build linux amd64 agentlink-server
+          build linux arm64 agentlink-server
+          build darwin arm64 agentlink-worker
+          build darwin amd64 agentlink-worker
+          tar -czf dist/agentlink-sdk.tar.gz sdk/runner.mjs sdk/package.json sdk/package-lock.json
+          (cd dist && sha256sum * > SHA256SUMS)
+      - uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-path: dist/*
+      - run: gh release create "$GITHUB_REF_NAME" dist/* --generate-notes
+        env:
+          GH_TOKEN: ${{ github.token }}

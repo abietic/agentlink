@@ -1,0 +1,10 @@
+[Unit]
+Description=agentlink server update from the latest GitHub release
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+# Match the server's listen address.
+Environment=AGENTLINK_HEALTH=http://127.0.0.1:8080/healthz
+ExecStart=/opt/agentlink/update-server.sh
