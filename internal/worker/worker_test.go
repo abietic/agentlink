@@ -253,7 +253,7 @@ func TestEndToEnd(t *testing.T) {
 	say := func(user, text string) string {
 		n++
 		body, _ := json.Marshal(tanka.Envelope{Type: "event_callback", EventID: fmt.Sprint("e", n), Event: &tanka.MentionEvent{
-			Type: "app_mention", UserID: user, RoomID: "R1", Text: "@bot " + text, ResponseURL: fake.URL + "/hooks/response/" + strconv.Itoa(n),
+			Type: "app_mention", UserID: user, RoomID: "room-canary-77", Text: "@bot " + text, ResponseURL: fake.URL + "/hooks/response/" + strconv.Itoa(n),
 		}})
 		ts := strconv.FormatInt(time.Now().Unix(), 10)
 		req, _ := http.NewRequest(http.MethodPost, hs.URL+"/tanka/events", bytes.NewReader(body))
@@ -305,10 +305,15 @@ func TestEndToEnd(t *testing.T) {
 		t.Fatal("worker did not stop")
 	}
 
-	// Both databases (and their WAL files) only ever held the prompt encrypted.
+	// Both databases (and their WAL files) only ever held the prompt encrypted, and the
+	// worker's does not reveal which rooms it serves (the server needs room ids to route).
 	for _, p := range []string{srvDB, srvDB + "-wal", filepath.Join(f.cfg.StateDir, "worker.db"), filepath.Join(f.cfg.StateDir, "worker.db-wal")} {
-		if b, _ := os.ReadFile(p); bytes.Contains(b, []byte("zebra-canary")) {
+		b, _ := os.ReadFile(p)
+		if bytes.Contains(b, []byte("zebra-canary")) {
 			t.Errorf("%s holds the prompt in plain text", filepath.Base(p))
+		}
+		if strings.HasPrefix(filepath.Base(p), "worker") && bytes.Contains(b, []byte("room-canary-77")) {
+			t.Errorf("%s holds the room id in plain text", filepath.Base(p))
 		}
 	}
 }

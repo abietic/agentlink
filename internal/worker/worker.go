@@ -461,7 +461,7 @@ func (w *Worker) roomLocked(roomID string) *RoomState {
 }
 
 func (w *Worker) saveLocked(roomID string) {
-	if err := w.store.put("room/"+roomID, w.state[roomID]); err != nil {
+	if err := w.store.putRoom(roomID, w.state[roomID]); err != nil {
 		log.Printf("save room %s: %v", roomID, err)
 	}
 }

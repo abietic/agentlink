@@ -1,11 +1,13 @@
 package worker
 
 import (
+	"crypto/hmac"
+	"crypto/sha256"
 	"database/sql"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"path/filepath"
-	"strings"
 
 	"agentlink/internal/seal"
 	"agentlink/internal/sqlite"
@@ -63,6 +65,23 @@ func (st *store) decode(k string, boxed []byte, v any) error {
 	return json.Unmarshal(plain, v)
 }
 
+// storedRoom is a room's state as stored. The kv key is derived from the room id (roomKey)
+// so the database does not reveal which rooms this device serves; the id lives in the box.
+type storedRoom struct {
+	RoomID string     `json:"room_id"`
+	State  *RoomState `json:"state"`
+}
+
+func (st *store) roomKey(roomID string) string {
+	m := hmac.New(sha256.New, st.key)
+	m.Write([]byte("agentlink/v1 room " + roomID))
+	return "room/" + hex.EncodeToString(m.Sum(nil)[:16])
+}
+
+func (st *store) putRoom(roomID string, rs *RoomState) error {
+	return st.put(st.roomKey(roomID), storedRoom{RoomID: roomID, State: rs})
+}
+
 func (st *store) rooms() (map[string]*RoomState, error) {
 	rows, err := st.db.Query(`SELECT k, v FROM kv WHERE k LIKE 'room/%'`)
 	if err != nil {
@@ -76,11 +95,14 @@ func (st *store) rooms() (map[string]*RoomState, error) {
 		if err := rows.Scan(&k, &boxed); err != nil {
 			return nil, err
 		}
-		rs := &RoomState{}
-		if err := st.decode(k, boxed, rs); err != nil {
+		var sr storedRoom
+		if err := st.decode(k, boxed, &sr); err != nil {
 			return nil, err
 		}
-		out[strings.TrimPrefix(k, "room/")] = rs
+		if sr.RoomID == "" || sr.State == nil {
+			continue
+		}
+		out[sr.RoomID] = sr.State
 	}
 	return out, rows.Err()
 }
