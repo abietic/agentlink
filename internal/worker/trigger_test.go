@@ -69,17 +69,28 @@ func TestTriggeredTask(t *testing.T) {
 	if err := w.admit(alert); err != nil {
 		t.Fatal(err)
 	}
-	if reply := w.handle(ctx, alert); !strings.Contains(reply, "echo: cd / and look @ "+sub) || strings.Contains(reply, "`"+tilde(sub)+"` · session") {
+	reply := w.handle(ctx, alert)
+	triggered := f.last(t)
+	if !strings.Contains(reply, "echo: cd / and look @ "+sub) || strings.Contains(reply, "`"+tilde(sub)+"` · session") || !strings.Contains(reply, "start with `"+short(triggered.SessionID)+"`") {
 		t.Fatalf("triggered reply: %q", reply)
 	}
-	triggered := f.last(t)
 	if triggered.Resume || triggered.SessionID == human {
 		t.Fatalf("triggered run resumed a session: %+v", triggered)
 	}
-	// The room now continues that session: a follow-up in the room resumes it.
+	// The room keeps its own session; the alert's is continued by starting with its id.
 	w.handle(ctx, proto.Task{ID: "t3", RoomID: "R1", UserID: "U1", Text: "go on"})
-	if r := f.last(t); !r.Resume || r.SessionID != triggered.SessionID || r.Cwd != sub {
-		t.Fatalf("follow-up: %+v", r)
+	if r := f.last(t); !r.Resume || r.SessionID != human || r.Cwd != f.root {
+		t.Fatalf("room follow-up: %+v", r)
+	}
+	w.handle(ctx, proto.Task{ID: "t4", RoomID: "R1", UserID: "U1", Text: "`" + short(triggered.SessionID) + "` why?"})
+	if r := f.last(t); !r.Resume || r.SessionID != triggered.SessionID || r.Cwd != sub || r.Prompt != "why?" {
+		t.Fatalf("addressed follow-up: %+v", r)
+	}
+	if got := w.state["R1"].SessionID; got != human {
+		t.Fatalf("an addressed follow-up switched the room to %s", got)
+	}
+	if r := w.handle(ctx, proto.Task{ID: "t5", RoomID: "R1", UserID: "U1", Text: "#" + triggered.SessionID[:6]}); !strings.Contains(r, "Start a message with its id") {
+		t.Fatalf("bare session id: %q", r)
 	}
 
 	if err := w.admit(alert); err == nil {

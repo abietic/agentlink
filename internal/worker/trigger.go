@@ -20,8 +20,9 @@ import (
 // (e.g. its Sentry hook) or from Command, which the worker runs every EverySec: each stdout
 // line is a JSON item {"key", "at", "text"}, and an item whose key has not been seen at that
 // time or later is queued for RoomID. A triggered task skips allowed_users and the room
-// commands, starts a new session in Workdir, and that session becomes the room's current
-// one, so people can follow up in the room.
+// commands and starts a new session in Workdir. That session joins the room's history but
+// does not become its current one: people follow up by starting a message with its id, so
+// each alert keeps its own thread and they run side by side.
 type Trigger struct {
 	Name      string   `json:"name"`
 	RoomID    string   `json:"room_id"` // required with command: the room its tasks run for and post to

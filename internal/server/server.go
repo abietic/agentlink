@@ -87,6 +87,7 @@ const helpText = `**agentlink** runs what you write on the device paired with th
 - ` + "`new [prompt]`" + ` — start a new session
 - ` + "`sessions`" + ` — recent sessions in this room
 - ` + "`resume <n|session-id> [prompt]`" + ` — switch to an earlier session, or to one started in a terminal
+- ` + "`<session-id> <prompt>`" + ` — continue that session without switching the room to it; ids are in ` + "`sessions`" + ` and in reply footers, and different sessions run side by side
 - anything else — a prompt, continuing the room's current session`
 
 type device struct {

@@ -10,19 +10,23 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"slices"
 	"strconv"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
 	"agentlink/internal/proto"
+	"agentlink/internal/seal"
 	"agentlink/internal/server"
 	"agentlink/internal/tanka"
 )
 
 // TestMain lets the test binary stand in for sdk/runner.mjs: with AGENTLINK_STUB_RUNNER
 // set it logs the request there, echoes the prompt and cwd, and reports the session id it
-// was given. The prompt "sleep" makes it hang.
+// was given. The prompt "sleep" makes it hang; "wait" holds it until the file named by
+// AGENTLINK_STUB_GATE exists.
 func TestMain(m *testing.M) {
 	if logPath := os.Getenv("AGENTLINK_STUB_RUNNER"); logPath != "" {
 		var req runRequest
@@ -32,6 +36,12 @@ func TestMain(m *testing.M) {
 		f.Close()
 		if req.Prompt == "sleep" {
 			time.Sleep(5 * time.Second)
+		}
+		for req.Prompt == "wait" {
+			if _, err := os.Stat(os.Getenv("AGENTLINK_STUB_GATE")); err == nil {
+				break
+			}
+			time.Sleep(20 * time.Millisecond)
 		}
 		cwd, _ := os.Getwd()
 		json.NewEncoder(os.Stdout).Encode(runReply{Type: "result", Text: "echo: " + req.Prompt + " @ " + cwd, SessionID: req.SessionID, NumTurns: 1, TotalCostUSD: 0.01})
@@ -210,6 +220,82 @@ func TestTimeoutKeepsTheSession(t *testing.T) {
 	if w.state["R1"].SessionID != sid {
 		t.Fatalf("timed-out session %s not kept: %+v", sid, w.state["R1"])
 	}
+}
+
+// TestSessionsRunSideBySide: a task addressed to another session does not wait for the room's
+// current one, a task addressed to the current session does, and no session ever has two runs
+// at once.
+func TestSessionsRunSideBySide(t *testing.T) {
+	var mu sync.Mutex
+	var order []string
+	posted := func() []string { mu.Lock(); defer mu.Unlock(); return slices.Clone(order) }
+	hs := httptest.NewServer(http.HandlerFunc(func(rw http.ResponseWriter, r *http.Request) {
+		var env proto.Envelope
+		json.NewDecoder(r.Body).Decode(&env)
+		mu.Lock()
+		order = append(order, env.ID)
+		mu.Unlock()
+	}))
+	defer hs.Close()
+	f := newFixture(t)
+	gate := filepath.Join(t.TempDir(), "gate")
+	t.Setenv("AGENTLINK_STUB_GATE", gate)
+	f.cfg.ServerURL = hs.URL
+	w, err := New(f.cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	w.setIdentity(Identity{DeviceID: "d", DeviceKey: seal.NewPrivateKey().Bytes(), ServerKey: seal.NewPrivateKey().PublicKey().Bytes()})
+	ctx := context.Background()
+	task := func(id, text string) proto.Task { return proto.Task{ID: id, RoomID: "R1", UserID: "U1", Text: text} }
+	w.handle(ctx, task("t0", "first"))
+	other := f.last(t).SessionID
+	w.handle(ctx, task("t1", "new second"))
+	current := f.last(t).SessionID
+	eventually := func(what string, ok func() bool) {
+		t.Helper()
+		for deadline := time.Now().Add(10 * time.Second); !ok(); time.Sleep(20 * time.Millisecond) {
+			if time.Now().After(deadline) {
+				t.Fatal(what)
+			}
+		}
+	}
+
+	w.dispatch(ctx, task("held", "wait"))
+	w.dispatch(ctx, task("same", short(current)+" after"))
+	w.dispatch(ctx, task("side", short(other)+" meanwhile"))
+	eventually("the task on another session waited for the room's", func() bool { return len(posted()) == 1 })
+	os.WriteFile(gate, nil, 0o600)
+	w.wg.Wait()
+	if want := []string{"side", "held", "same"}; !slices.Equal(posted(), want) {
+		t.Fatalf("results in order %v, want %v", posted(), want)
+	}
+	if len(w.queues)+len(w.running)+len(w.locks) != 0 || w.state["R1"].SessionID != current {
+		t.Fatalf("left behind: queues %v, running %v, locks %v, current %s", w.queues, w.running, w.locks, w.state["R1"].SessionID)
+	}
+
+	// Two runs on one session, however they got there, take turns.
+	os.Remove(gate)
+	var wg sync.WaitGroup
+	for _, id := range []string{"a", "b"} {
+		wg.Add(1)
+		go func() { defer wg.Done(); w.handle(ctx, task(id, short(other)+" wait")) }()
+	}
+	locked := func() (holders, running int) {
+		w.mu.Lock()
+		defer w.mu.Unlock()
+		if l := w.locks[other]; l != nil {
+			holders = l.holders
+		}
+		return holders, len(w.running)
+	}
+	eventually("both runs never reached the session", func() bool { h, _ := locked(); return h == 2 })
+	time.Sleep(100 * time.Millisecond)
+	if _, n := locked(); n != 1 {
+		t.Fatalf("%d runs on one session at once", n)
+	}
+	os.WriteFile(gate, nil, 0o600)
+	wg.Wait()
 }
 
 // TestEndToEnd wires a real server, a fake Tanka and a worker with the stub CLI.

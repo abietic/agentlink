@@ -34,9 +34,10 @@ Tanka 群 ──@bot──▶ agentlink-server ◀──长轮询── agentlin
 | `status` | 设备、工作目录、当前会话、正在跑什么；prompt 运行中也会立即回答 |
 | `cd <path>` / `workdir [path]` | 切换工作目录，只能在 `workdir_roots` 之内；切换后下一条 prompt 新开会话 |
 | `new [prompt]` | 新开会话，可以同时带上第一条 prompt |
-| `sessions` | 本群最近 10 个会话 |
+| `sessions` | 本群最近 15 个会话（记住 50 个） |
 | `resume <序号 \| id 前缀 \| 完整 UUID> [prompt]` | 切回旧会话；用完整 UUID 可以接手在终端里开的会话 |
 | `help` 或只 @ 不写内容 | 帮助 |
+| `<会话 id 前缀> <prompt>` | 在那个会话里继续（至少 6 位，回帖页脚和 `sessions` 里有），不切换群的当前会话；不同会话可以同时跑 |
 | 其他任何内容 | 作为 prompt，在当前会话里执行 |
 
 命令词不区分大小写，可以带 `/`。
@@ -53,7 +54,8 @@ Tanka 不会把机器人或 incoming webhook 发出的 @ 投递成 `app_mention`
 ```
 
 - 任务带着触发名（Sentry 钩子默认 `sentry`）。worker 只执行 `triggers` 里有同名配置的任务；同一个 key 在 `dedupe_sec`（默认 30 分钟）内只跑一次，推送和轮询同时到也只跑一次。不认识的触发名、重复的 key 都静默跳过。
-- 触发任务不检查 `allowed_users`，文本不当群命令解析；在该 trigger 的 `workdir` 新开会话，这个会话成为群里的当前会话，群里的人 @ 机器人可以接着追问。
+- 触发任务不检查 `allowed_users`，文本不当群命令解析；在该 trigger 的 `workdir` 新开会话。这个会话记进群的会话历史，但不成为当前会话：回帖页脚写着会话 id，群里的人 @ 机器人、以这个 id 开头就能接着追问，每条告警各自一条线，互不串话。
+- 排队：群自己的命令和当前会话的 prompt 排一队；指名某个会话的消息只跟同一会话排队；每个触发任务单独一队。不同队列并行，总数受 `max_concurrency` 限制；同一个会话无论从哪个队列来，同一时刻只跑一个。
 - 结果没有 `response_url`，只能发到群的 incoming webhook，所以该群必须配 `room_webhooks`。空结果不发；排队超时的触发任务静默丢弃。
 - server 的 `rooms`（群 id → device id）在启动时写入绑定，触发用的群不必有人去发 `pair`。
 

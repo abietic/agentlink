@@ -27,8 +27,9 @@ import (
 )
 
 const (
-	maxSessions   = 10
-	roomQueueSize = 16
+	maxSessions  = 50 // remembered per room: alerts open sessions often, and people come back to them
+	listSessions = 15 // shown by `sessions`
+	queueSize    = 16 // waiting tasks per queue
 )
 
 type Session struct {
@@ -56,8 +57,22 @@ type Identity struct {
 }
 
 type running struct {
-	since  time.Time
-	prompt string
+	room, session string
+	since         time.Time
+	prompt        string
+}
+
+// queue holds tasks that run one after another: a room's own commands and prompts on its
+// current session, one addressed session, or one triggered task. Different queues run side
+// by side, up to max_concurrency.
+type queue struct {
+	room  string
+	tasks []proto.Task // the head is running
+}
+
+type sessionLock struct {
+	mu      sync.Mutex
+	holders int // running or waiting
 }
 
 type Worker struct {
@@ -74,8 +89,9 @@ type Worker struct {
 	key       *ecdh.PrivateKey
 	serverKey *ecdh.PublicKey
 	state     map[string]*RoomState // by room_id
-	rooms     map[string]chan proto.Task
-	running   map[string]running
+	queues    map[string]*queue     // by queueKey
+	running   map[string]running    // by task id
+	locks     map[string]*sessionLock
 	marks     map[string]time.Time // trigger dedupe: "seen/<trigger>/<key>" and "ran/<trigger>/<key>"
 }
 
@@ -91,8 +107,9 @@ func New(cfg Config) (*Worker, error) {
 		store:   st,
 		sem:     make(chan struct{}, cfg.MaxConcurrency),
 		now:     time.Now,
-		rooms:   map[string]chan proto.Task{},
+		queues:  map[string]*queue{},
 		running: map[string]running{},
+		locks:   map[string]*sessionLock{},
 		marks:   map[string]time.Time{},
 	}
 	if w.state, err = st.rooms(); err != nil {
@@ -217,53 +234,93 @@ func (w *Worker) dispatch(ctx context.Context, t proto.Task) {
 		go w.send(t, w.query(t.RoomID, cmd.name)) // read-only, so it answers even while a prompt runs
 		return
 	}
-	select {
-	case w.roomQueue(ctx, t.RoomID) <- t:
-	default:
-		go w.send(t, fmt.Sprintf("This room already has %d tasks waiting on this device; try again later.", roomQueueSize))
+	if !w.enqueue(ctx, w.queueKey(t), t) {
+		go w.send(t, fmt.Sprintf("%d tasks are already waiting for this session on this device; try again later.", queueSize))
 	}
 }
 
-func (w *Worker) roomQueue(ctx context.Context, roomID string) chan proto.Task {
+// queueKey picks the queue t waits in. A triggered task starts its own session, so it waits
+// for nothing; a task addressed to a session other than the room's current one waits only
+// for that session; everything else is the room's.
+func (w *Worker) queueKey(t proto.Task) string {
+	if t.Trigger != "" {
+		return "task " + t.ID
+	}
+	if s, _, ok := w.addressed(t.RoomID, t.Text); ok {
+		w.mu.Lock()
+		current := w.roomLocked(t.RoomID).SessionID
+		w.mu.Unlock()
+		if s.ID != current {
+			return "session " + t.RoomID + " " + s.ID
+		}
+	}
+	return "room " + t.RoomID
+}
+
+// enqueue appends t to its queue, starting a goroutine to drain the queue if none is.
+func (w *Worker) enqueue(ctx context.Context, key string, t proto.Task) bool {
 	w.mu.Lock()
 	defer w.mu.Unlock()
-	ch := w.rooms[roomID]
-	if ch == nil {
-		ch = make(chan proto.Task, roomQueueSize)
-		w.rooms[roomID] = ch
+	q := w.queues[key]
+	if q == nil {
+		q = &queue{room: t.RoomID}
+		w.queues[key] = q
 		w.wg.Add(1)
-		go w.roomLoop(ctx, ch)
+		go w.drain(ctx, key, q)
+	} else if len(q.tasks) > queueSize {
+		return false
 	}
-	return ch
+	q.tasks = append(q.tasks, t)
+	return true
 }
 
-// roomLoop runs one room's tasks in order, so a room's prompts never race on its session.
-func (w *Worker) roomLoop(ctx context.Context, ch chan proto.Task) {
+// drain runs one queue's tasks in order and exits once it is empty.
+func (w *Worker) drain(ctx context.Context, key string, q *queue) {
 	defer w.wg.Done()
 	for {
-		select {
-		case t := <-ch:
-			if ctx.Err() == nil {
-				select {
-				case w.sem <- struct{}{}:
-					reply := w.handle(ctx, t)
-					<-w.sem
-					w.send(t, reply)
-					continue
-				case <-ctx.Done():
-				}
-			}
-			w.send(t, "The worker shut down before running this.")
-		case <-ctx.Done():
-			for {
-				select {
-				case t := <-ch:
-					w.send(t, "The worker shut down before running this.")
-				default:
-					return
-				}
+		w.mu.Lock()
+		if len(q.tasks) == 0 {
+			delete(w.queues, key)
+			w.mu.Unlock()
+			return
+		}
+		t := q.tasks[0]
+		w.mu.Unlock()
+		reply := "The worker shut down before running this."
+		if ctx.Err() == nil {
+			select {
+			case w.sem <- struct{}{}:
+				reply = w.handle(ctx, t)
+				<-w.sem
+			case <-ctx.Done():
 			}
 		}
+		w.send(t, reply)
+		w.mu.Lock()
+		q.tasks = q.tasks[1:]
+		w.mu.Unlock()
+	}
+}
+
+// lockSession waits until no other run uses sid, so two runs never resume one transcript at
+// once whichever queues they came through. The returned func releases it.
+func (w *Worker) lockSession(sid string) func() {
+	w.mu.Lock()
+	l := w.locks[sid]
+	if l == nil {
+		l = &sessionLock{}
+		w.locks[sid] = l
+	}
+	l.holders++
+	w.mu.Unlock()
+	l.mu.Lock()
+	return func() {
+		l.mu.Unlock()
+		w.mu.Lock()
+		if l.holders--; l.holders == 0 {
+			delete(w.locks, sid)
+		}
+		w.mu.Unlock()
 	}
 }
 
@@ -314,12 +371,16 @@ func parseCommand(text string) command {
 // handle runs a task that may change room state or start Claude; it returns the reply.
 func (w *Worker) handle(ctx context.Context, t proto.Task) string {
 	if tr := w.trigger(t.Trigger); tr != nil { // the text is a prompt, never a room command
-		w.mu.Lock()
-		rs := w.roomLocked(t.RoomID)
-		rs.Workdir, rs.SessionID = tr.Workdir, ""
-		w.saveLocked(t.RoomID)
-		w.mu.Unlock()
-		return w.prompt(ctx, t, t.Text)
+		return w.prompt(ctx, t, Run{Workdir: tr.Workdir, Prompt: t.Text}, false)
+	}
+	if s, text, ok := w.addressed(t.RoomID, t.Text); ok {
+		if text == "" {
+			return fmt.Sprintf("Session `%s` is in `%s`. Start a message with its id to continue it, or `resume %s` to make it this room's current session.", short(s.ID), tilde(s.Workdir), short(s.ID))
+		}
+		if _, err := resolveWorkdir(w.cfg.WorkdirRoots, "/", s.Workdir); err != nil {
+			return "Cannot continue: " + err.Error()
+		}
+		return w.prompt(ctx, t, Run{Workdir: s.Workdir, SessionID: s.ID, Resume: true, Prompt: text}, false)
 	}
 	cmd := parseCommand(t.Text)
 	switch cmd.name {
@@ -338,7 +399,21 @@ func (w *Worker) handle(ctx context.Context, t proto.Task) string {
 			return msg
 		}
 	}
-	return w.prompt(ctx, t, cmd.prompt)
+	return w.prompt(ctx, t, Run{Prompt: cmd.prompt}, true)
+}
+
+// addressed reports whether text starts with the id (or a 6+ character prefix of it) of one
+// of the room's sessions, and returns that session and the rest of the text.
+func (w *Worker) addressed(roomID, text string) (Session, string, bool) {
+	word, rest := proto.CutWord(text)
+	ref := strings.ToLower(strings.Trim(word, "`#"))
+	if len(ref) < 6 || strings.Trim(ref, "0123456789abcdef-") != "" {
+		return Session{}, "", false
+	}
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	s, ok := sessionByPrefix(w.roomLocked(roomID).Sessions, ref)
+	return s, rest, ok
 }
 
 func (w *Worker) chdir(roomID, arg string) string {
@@ -379,25 +454,36 @@ func (w *Worker) resume(roomID, ref string) (string, bool) {
 	return fmt.Sprintf("Resumed session `%s` in `%s`.", short(s.ID), tilde(s.Workdir)), true
 }
 
-func (w *Worker) prompt(ctx context.Context, t proto.Task, text string) string {
+// prompt runs run; with current it runs in the room's workdir and current session, and the
+// session it ends in becomes current. Otherwise the room's selection is left alone and the
+// session is only added to its history.
+func (w *Worker) prompt(ctx context.Context, t proto.Task, run Run, current bool) string {
+	text := run.Prompt
 	w.mu.Lock()
-	rs := w.roomLocked(t.RoomID)
-	run := Run{Workdir: rs.Workdir, SessionID: rs.SessionID, Resume: rs.SessionID != "", Prompt: text}
+	if current {
+		rs := w.roomLocked(t.RoomID)
+		run.Workdir, run.SessionID, run.Resume = rs.Workdir, rs.SessionID, rs.SessionID != ""
+	}
 	if !run.Resume {
 		run.SessionID = newUUID()
 	}
-	w.running[t.RoomID] = running{since: w.now(), prompt: text}
+	w.mu.Unlock()
+	defer w.lockSession(run.SessionID)()
+	w.mu.Lock()
+	w.running[t.ID] = running{room: t.RoomID, session: run.SessionID, since: w.now(), prompt: text}
 	w.mu.Unlock()
 
 	log.Printf("task %s: running in %s, session %s (resume=%v)", t.ID, run.Workdir, short(run.SessionID), run.Resume)
 	res, err := w.runner.Run(ctx, run)
 
 	w.mu.Lock()
-	delete(w.running, t.RoomID)
+	delete(w.running, t.ID)
 	if res.SessionID != "" || res.Stopped { // a stopped run still leaves a resumable transcript
 		sid := cmp.Or(res.SessionID, run.SessionID)
 		rs := w.roomLocked(t.RoomID)
-		rs.SessionID = sid
+		if current {
+			rs.SessionID = sid
+		}
 		rs.remember(Session{ID: sid, Workdir: run.Workdir, Title: preview(text, 40), LastUsed: w.now()})
 		w.saveLocked(t.RoomID)
 	}
@@ -432,6 +518,9 @@ func (w *Worker) format(ctx context.Context, t proto.Task, run Run, res RunResul
 		fmt.Fprintf(&b, "`%s` · `%s` · ", w.id.DeviceID, tilde(run.Workdir))
 	}
 	fmt.Fprintf(&b, "session `%s`", session)
+	if t.Trigger != "" && session != "none" {
+		fmt.Fprintf(&b, " (to follow up, @ me and start with `%s`)", session)
+	}
 	if res.Turns > 0 {
 		fmt.Fprintf(&b, " · %d turns", res.Turns)
 	}
@@ -451,13 +540,16 @@ func (w *Worker) query(roomID, name string) string {
 		if len(rs.Sessions) == 0 {
 			return "No sessions in this room yet."
 		}
-		b.WriteString("**Recent sessions** (`resume <n>` switches to one)\n")
-		for i, s := range rs.Sessions {
+		b.WriteString("**Recent sessions** (start a message with an id to continue that session; `resume <n>` switches the room to it)\n")
+		for i, s := range rs.Sessions[:min(len(rs.Sessions), listSessions)] {
 			mark := ""
 			if s.ID == rs.SessionID {
 				mark = " ← current"
 			}
 			fmt.Fprintf(&b, "%d. `%s` · `%s` · %s · %s%s\n", i+1, short(s.ID), tilde(s.Workdir), s.LastUsed.Local().Format("01-02 15:04"), s.Title, mark)
+		}
+		if n := len(rs.Sessions) - listSessions; n > 0 {
+			fmt.Fprintf(&b, "… and %d older\n", n)
 		}
 		return strings.TrimRight(b.String(), "\n")
 	}
@@ -468,13 +560,27 @@ func (w *Worker) query(roomID, name string) string {
 	} else {
 		fmt.Fprintf(&b, "- **Session** `%s`: prompts continue it, `new` starts another\n", short(rs.SessionID))
 	}
-	if r, ok := w.running[roomID]; ok {
-		fmt.Fprintf(&b, "- **Running** for %s: %s\n", w.now().Sub(r.since).Round(time.Second), preview(r.prompt, 60))
-	} else {
+	var runs []running
+	for _, r := range w.running {
+		if r.room == roomID {
+			runs = append(runs, r)
+		}
+	}
+	slices.SortFunc(runs, func(a, b running) int { return a.since.Compare(b.since) })
+	if len(runs) == 0 {
 		b.WriteString("- **Running** nothing\n")
 	}
-	if n := len(w.rooms[roomID]); n > 0 {
-		fmt.Fprintf(&b, "- **Queued** %d\n", n)
+	for _, r := range runs {
+		fmt.Fprintf(&b, "- **Running** `%s` for %s: %s\n", short(r.session), w.now().Sub(r.since).Round(time.Second), preview(r.prompt, 60))
+	}
+	queued := 0
+	for _, q := range w.queues {
+		if q.room == roomID {
+			queued += max(len(q.tasks)-1, 0)
+		}
+	}
+	if queued > 0 {
+		fmt.Fprintf(&b, "- **Queued** %d\n", queued)
 	}
 	return strings.TrimRight(b.String(), "\n")
 }
@@ -513,12 +619,16 @@ func (rs *RoomState) remember(s Session) {
 
 // findSession matches a 1-based position in the history or a unique id prefix (4+ chars).
 func findSession(ss []Session, ref string) (Session, bool) {
-	if n, err := strconv.Atoi(ref); err == nil {
+	if n, err := strconv.Atoi(ref); err == nil && len(ref) < 4 { // an id prefix may be all digits
 		if n >= 1 && n <= len(ss) {
 			return ss[n-1], true
 		}
 		return Session{}, false
 	}
+	return sessionByPrefix(ss, ref)
+}
+
+func sessionByPrefix(ss []Session, ref string) (Session, bool) {
 	var hit []Session
 	for _, s := range ss {
 		if len(ref) >= 4 && strings.HasPrefix(s.ID, ref) {
