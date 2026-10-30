@@ -6,3 +6,6 @@
 *.key
 /sdk/node_modules/
 .DS_Store
+
+# live deployment files (hosts, ids); kept local
+/deploy/
