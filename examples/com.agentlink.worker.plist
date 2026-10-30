@@ -1,0 +1,27 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!-- Keeps agentlink-worker running as a user LaunchAgent. Replace USER, then:
+     cp examples/com.agentlink.worker.plist ~/Library/LaunchAgents/
+     launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.agentlink.worker.plist -->
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.agentlink.worker</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/Users/USER/go/bin/agentlink-worker</string>
+  </array>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <!-- launchd starts with a minimal PATH; claude and the tools it runs must be on it. -->
+    <key>PATH</key>
+    <string>/Users/USER/.local/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+  </dict>
+  <key>RunAtLoad</key>
+  <true/>
+  <key>KeepAlive</key>
+  <true/>
+  <key>StandardErrorPath</key>
+  <string>/Users/USER/.agentlink/worker.log</string>
+</dict>
+</plist>
