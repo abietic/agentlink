@@ -18,6 +18,7 @@ type Run struct {
 	SessionID string
 	Resume    bool // continue SessionID; otherwise start a new session with that id
 	Prompt    string
+	Images    []Image // go in the same message as Prompt, before it
 }
 
 type RunResult struct {
@@ -41,6 +42,7 @@ type runRequest struct {
 	Prompt    string          `json:"prompt"`
 	SessionID string          `json:"session_id"`
 	Resume    bool            `json:"resume"`
+	Images    []Image         `json:"images,omitempty"`
 	Options   json.RawMessage `json:"options,omitempty"`
 }
 
@@ -67,7 +69,7 @@ type SDK struct {
 func (c SDK) Run(ctx context.Context, r Run) (RunResult, error) {
 	ctx, cancel := context.WithTimeout(ctx, c.Timeout)
 	defer cancel()
-	req, err := json.Marshal(runRequest{Cwd: r.Workdir, Prompt: r.Prompt, SessionID: r.SessionID, Resume: r.Resume, Options: c.Options})
+	req, err := json.Marshal(runRequest{Cwd: r.Workdir, Prompt: r.Prompt, SessionID: r.SessionID, Resume: r.Resume, Images: r.Images, Options: c.Options})
 	if err != nil {
 		return RunResult{}, err
 	}

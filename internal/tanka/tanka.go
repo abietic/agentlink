@@ -71,6 +71,16 @@ type MentionEvent struct {
 	RoomID      string `json:"room_id"`
 	RoomName    string `json:"room_name"`
 	ResponseURL string `json:"response_url"`
+	// Attachments is not in Tanka's docs: one item per file or image sent with the
+	// mention, [] for text only. Each url is a download link that needs no login.
+	Attachments []Attachment `json:"attachments"`
+}
+
+// Attachment is the part of an attachments item this project uses. Tanka also sends
+// file_id, file_type, size, width, height, message_id and msg_type.
+type Attachment struct {
+	URL  string `json:"url"`
+	Name string `json:"name"`
 }
 
 // Message is a BotMessagePayload, accepted by response_url and incoming webhooks.

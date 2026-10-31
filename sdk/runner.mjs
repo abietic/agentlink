@@ -1,6 +1,7 @@
 // Runs one prompt through the Claude Agent SDK for agentlink-worker.
 //
-// stdin:  {"cwd", "prompt", "session_id", "resume", "options"} — options go to query()
+// stdin:  {"cwd", "prompt", "session_id", "resume", "images", "options"} — options go to query();
+//         images ([{media_type, data (base64)}]) go in the prompt's message, before its text
 // stdout: one JSON line, {"type":"result", ...} or {"type":"error", "error", "session_id"}
 // SIGTERM aborts the query; the session keeps what was done so far.
 import { query } from '@anthropic-ai/claude-agent-sdk';
@@ -19,8 +20,17 @@ else options.sessionId = req.session_id; // a new session under the id the worke
 const print = (o) => process.stdout.write(JSON.stringify(o) + '\n');
 let sessionId = req.session_id;
 let result;
+let prompt = req.prompt;
+if (req.images?.length) {
+  const content = req.images.map((i) => ({ type: 'image', source: { type: 'base64', media_type: i.media_type, data: i.data } }));
+  if (req.prompt) content.push({ type: 'text', text: req.prompt }); // the API refuses an empty text block
+  // A one-message stream: the SDK keeps stdin open until the run ends when it needs to.
+  prompt = (async function* () {
+    yield { type: 'user', message: { role: 'user', content }, parent_tool_use_id: null, session_id: req.session_id };
+  })();
+}
 try {
-  for await (const m of query({ prompt: req.prompt, options })) {
+  for await (const m of query({ prompt, options })) {
     if (m.session_id) sessionId = m.session_id;
     if (m.type === 'result') result = m;
   }

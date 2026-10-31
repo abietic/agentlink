@@ -22,6 +22,14 @@ type Task struct {
 	// Key says what a triggered task is about; the worker skips one whose key it already
 	// ran within the trigger's dedupe window, so a hook and a poller can watch one source.
 	Key string `json:"key,omitempty"`
+	// Attachments sent with the mention. The worker downloads the images among them; the
+	// server only passes the links on, sealed, since anyone holding one can download it.
+	Attachments []Attachment `json:"attachments,omitempty"`
+}
+
+type Attachment struct {
+	URL  string `json:"url"`
+	Name string `json:"name"`
 }
 
 // Result is the worker's reply to a task, posted to the task's room as markdown.

@@ -36,11 +36,13 @@ Tanka 群 ──@bot──▶ agentlink-server ◀──长轮询── agentlin
 | `new [prompt]` | 新开会话，可以同时带上第一条 prompt |
 | `sessions` | 本群最近 15 个会话（记住 50 个） |
 | `resume <序号 \| id 前缀 \| 完整 UUID> [prompt]` | 切回旧会话；用完整 UUID 可以接手在终端里开的会话 |
-| `help` 或只 @ 不写内容 | 帮助 |
+| `help` 或只 @ 不写内容（也不带图） | 帮助 |
 | `<会话 id 前缀> <prompt>` | 在那个会话里继续（至少 6 位，回帖页脚和 `sessions` 里有），不切换群的当前会话；不同会话可以同时跑 |
 | 其他任何内容 | 作为 prompt，在当前会话里执行 |
 
 命令词不区分大小写，可以带 `/`。
+
+**图片**：和 @ 同一条消息发出的图片（PNG / JPEG / GIF / WebP）会和文字一起交给 Claude；只发图不写字也算 prompt。图片来自事件里文档没写的 `attachments` 字段：server 只把下载链接加密转给 worker，由 worker 去下载，并且只下载 `tanka.ai` 域名下的 https 链接。每条消息最多 5 张，每张不超过 3.75 MB（API 对 base64 后 5 MB 的上限），超出的、不是图片的附件会在回帖里列出来，不会悄悄丢掉。
 
 ## 触发式任务（没人 @ 也能跑）
 
@@ -106,7 +108,7 @@ AGENTLINK_ENROLL_TOKEN=... agentlink-worker
 - **谁能驱动机器**：server 的 `allowed_users` 是可选的粗过滤；最终由 worker 本机的 `allowed_users` 决定，默认拒绝所有人。设备注册需要 enroll token。
 - **能做什么**：工作目录限制在 `workdir_roots` 之内（先解析符号链接再判断）。默认 `permissionMode: "auto"`：由模型分类器逐个批准或拒绝工具调用，判断不了的一律拒绝（没人在场回答权限询问），回复里会注明被拒绝的次数。要更严就改成 `"dontAsk"` 并用 `allowedTools` 预先放行，要更松就在 `allowedTools` 里加。群消息是不可信输入，可能被用来做 prompt 注入；分类器能挡住一部分，但不等于沙箱，`allowed_users` 要保持最小。
 - **触发任务**：只有两个来源能产生——server 的 Sentry 钩子（HMAC 校验）和设备自己（用设备密钥加密），所以不过 `allowed_users`。但告警标题等字段是外部可控的文本，同样是 prompt 注入面：模板里的字段会被压成一行并截断，prompt 里要写明它们只是数据。
-- **数据**：会话的完整记录留在 worker 本机（Claude Code 自己的 `~/.claude/projects`）。
+- **数据**：会话的完整记录留在 worker 本机（Claude Code 自己的 `~/.claude/projects`），群里发的图片也在里面。附件链接不用登录就能下载，所以只在加密的任务里传，不写日志、不出现在错误信息里。
 
 ## 开发
 

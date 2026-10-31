@@ -296,12 +296,12 @@ func (s *Server) onMention(bot *Bot, ev tanka.MentionEvent) {
 	}
 	text := stripMention(ev.Text, bot.Mentions)
 	word, arg := proto.CutWord(text)
-	switch proto.Keyword(word) {
-	case "", "help":
+	switch kw := proto.Keyword(word); {
+	case kw == "" && len(ev.Attachments) == 0, kw == "help": // an image alone is a prompt
 		s.replyAsync(bot, ev.RoomID, ev.ResponseURL, helpText)
-	case "pair":
+	case kw == "pair":
 		s.replyAsync(bot, ev.RoomID, ev.ResponseURL, s.pair(bot, ev, arg))
-	case "unpair":
+	case kw == "unpair":
 		s.replyAsync(bot, ev.RoomID, ev.ResponseURL, s.unpair(bot, ev.RoomID))
 	default:
 		s.enqueue(bot, ev, text)
@@ -391,11 +391,13 @@ func (s *Server) enqueue(bot *Bot, ev tanka.MentionEvent, text string) {
 	case queued >= maxQueuePerDev:
 		msg = fmt.Sprintf("Device `%s` already has %d tasks waiting; try again later.", d.ID, maxQueuePerDev)
 	default:
-		id, err := s.insertTask(bot, d, proto.Task{
-			RoomID: ev.RoomID, RoomName: ev.RoomName, UserID: ev.UserID, UserName: ev.UserName, Text: text,
-		}, ev.ResponseURL)
+		t := proto.Task{RoomID: ev.RoomID, RoomName: ev.RoomName, UserID: ev.UserID, UserName: ev.UserName, Text: text}
+		for _, a := range ev.Attachments {
+			t.Attachments = append(t.Attachments, proto.Attachment{URL: a.URL, Name: a.Name})
+		}
+		id, err := s.insertTask(bot, d, t, ev.ResponseURL)
 		if err == nil {
-			log.Printf("task %s queued bot=%s room=%s user=%s device=%s", id, bot.Name, ev.RoomID, ev.UserID, d.ID)
+			log.Printf("task %s queued bot=%s room=%s user=%s device=%s attachments=%d", id, bot.Name, ev.RoomID, ev.UserID, d.ID, len(t.Attachments))
 			return
 		}
 		log.Printf("enqueue: %v", err)

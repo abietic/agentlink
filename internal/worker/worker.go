@@ -13,6 +13,7 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"net/http"
 	"net/url"
 	"regexp"
 	"slices"
@@ -84,6 +85,8 @@ type Worker struct {
 	sem    chan struct{}
 	now    func() time.Time
 	wg     sync.WaitGroup
+	files  *http.Client        // downloads attachments
+	fileOK func(*url.URL) bool // which attachment links may be downloaded
 
 	mu        sync.Mutex
 	id        Identity
@@ -112,6 +115,8 @@ func New(cfg Config) (*Worker, error) {
 		running: map[string]running{},
 		locks:   map[string]*sessionLock{},
 		marks:   map[string]time.Time{},
+		files:   attachmentClient,
+		fileOK:  tankaFile,
 	}
 	if w.state, err = st.rooms(); err != nil {
 		return nil, err
@@ -388,7 +393,7 @@ func (w *Worker) handle(ctx context.Context, t proto.Task) string {
 		return w.prompt(ctx, t, Run{Workdir: tr.Workdir, Prompt: t.Text}, false)
 	}
 	if s, text, ok := w.addressed(t.RoomID, t.Text); ok {
-		if text == "" {
+		if text == "" && len(t.Attachments) == 0 {
 			return fmt.Sprintf("Session `%s` is in `%s`. Start a message with its id to continue it, or `resume %s` to make it this room's current session.", short(s.ID), tilde(s.Workdir), short(s.ID))
 		}
 		if _, err := resolveWorkdir(w.cfg.WorkdirRoots, "/", s.Workdir); err != nil {
@@ -405,11 +410,11 @@ func (w *Worker) handle(ctx context.Context, t proto.Task) string {
 		w.roomLocked(t.RoomID).SessionID = ""
 		w.saveLocked(t.RoomID)
 		w.mu.Unlock()
-		if cmd.prompt == "" {
+		if cmd.prompt == "" && len(t.Attachments) == 0 {
 			return "Started a new session: the next prompt opens it."
 		}
 	case "resume":
-		if msg, ok := w.resume(t.RoomID, cmd.arg); !ok || cmd.prompt == "" {
+		if msg, ok := w.resume(t.RoomID, cmd.arg); !ok || cmd.prompt == "" && len(t.Attachments) == 0 {
 			return msg
 		}
 	}
@@ -472,7 +477,15 @@ func (w *Worker) resume(roomID, ref string) (string, bool) {
 // session it ends in becomes current. Otherwise the room's selection is left alone and the
 // session is only added to its history.
 func (w *Worker) prompt(ctx context.Context, t proto.Task, run Run, current bool) string {
-	text := run.Prompt
+	var skipped []string
+	if len(t.Attachments) > 0 {
+		run.Images, skipped = fetchImages(ctx, w.files, w.fileOK, t.Attachments)
+		log.Printf("task %s: passing on %d of %d attachments", t.ID, len(run.Images), len(t.Attachments))
+	}
+	if run.Prompt == "" && len(run.Images) == 0 {
+		return "Nothing to run: the message has no text, and its attachments were not passed on: " + strings.Join(skipped, ", ") + "."
+	}
+	text := cmp.Or(run.Prompt, "(image)")
 	w.mu.Lock()
 	if current {
 		rs := w.roomLocked(t.RoomID)
@@ -503,10 +516,10 @@ func (w *Worker) prompt(ctx context.Context, t proto.Task, run Run, current bool
 	}
 	w.mu.Unlock()
 	log.Printf("task %s: finished in %s (error=%v)", t.ID, res.Duration.Round(time.Second), err != nil || res.IsError)
-	return w.format(ctx, t, run, res, err)
+	return w.format(ctx, t, run, res, err, skipped)
 }
 
-func (w *Worker) format(ctx context.Context, t proto.Task, run Run, res RunResult, err error) string {
+func (w *Worker) format(ctx context.Context, t proto.Task, run Run, res RunResult, err error, skipped []string) string {
 	var b strings.Builder
 	switch {
 	case res.Stopped && ctx.Err() != nil:
@@ -522,6 +535,9 @@ func (w *Worker) format(ctx context.Context, t proto.Task, run Run, res RunResul
 	}
 	if res.Denials > 0 {
 		fmt.Fprintf(&b, "\n\n⚠️ %d tool call(s) were denied by this device's permission settings.", res.Denials)
+	}
+	if len(skipped) > 0 {
+		b.WriteString("\n\n⚠️ Not passed on to Claude: " + strings.Join(skipped, ", ") + ".")
 	}
 	session := "none"
 	if res.SessionID != "" || res.Stopped || run.Resume {

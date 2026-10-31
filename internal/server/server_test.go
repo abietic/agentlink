@@ -10,6 +10,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"slices"
 	"strconv"
 	"strings"
 	"sync/atomic"
@@ -430,5 +431,33 @@ func TestShape(t *testing.T) {
 	want := "{event:{n:null,ok:bool,refs:[{url:string,w:number}]x1,tags:[],text:string},type:string}"
 	if got := shape(v); got != want {
 		t.Fatalf("shape = %s\nwant    %s", got, want)
+	}
+}
+
+// TestImageOnlyMention: an @ with an image and no text is a prompt, not a request for help,
+// and the attachment links reach the device inside the sealed task.
+func TestImageOnlyMention(t *testing.T) {
+	_, base, ft := newTestServer(t, nil)
+	dev := register(t, base, "")
+	sendEvent(t, base, mention(ft, "R1", "U1", "@Agent Link pair "+dev.DeviceID))
+	ft.next(t)
+	dev.poll(t) // online
+
+	sendEvent(t, base, mention(ft, "R1", "U1", "@Agent Link"))
+	if p := ft.next(t); !strings.Contains(p.text, "agentlink") {
+		t.Fatalf("a bare mention should get help: %q", p.text)
+	}
+
+	// As Tanka sends it, with the fields this project does not read.
+	body := []byte(`{"type":"event_callback","event_id":"ev-img","event":{"type":"app_mention","user_id":"U1","room_id":"R1",
+		"text":"@Agent Link ","response_url":"` + ft.URL + `/hooks/response/tok","attachments":[{"file_id":"f1","file_type":"png",
+		"height":10,"width":20,"message_id":"m1","msg_type":2,"name":"shot.png","size":123,"url":"https://gw-tk.tanka.ai/npc/v2/file/abc"}]}}`)
+	if resp := signedPost(t, base+"/tanka/events", secret, body, time.Now()); resp.StatusCode != http.StatusOK {
+		t.Fatalf("event: HTTP %d", resp.StatusCode)
+	}
+	task := dev.poll(t)
+	want := []proto.Attachment{{URL: "https://gw-tk.tanka.ai/npc/v2/file/abc", Name: "shot.png"}}
+	if task == nil || task.Text != "" || !slices.Equal(task.Attachments, want) {
+		t.Fatalf("task = %+v", task)
 	}
 }
