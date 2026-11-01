@@ -28,6 +28,10 @@ import (
 // was given. The prompt "sleep" makes it hang; "wait" holds it until the file named by
 // AGENTLINK_STUB_GATE exists.
 func TestMain(m *testing.M) {
+	if logPath := os.Getenv("AGENTLINK_STUB_MIRASIM"); logPath != "" && len(os.Args) > 1 && os.Args[1] == "ui-cli" {
+		stubMirasim(logPath, os.Args[1:])
+		return
+	}
 	if logPath := os.Getenv("AGENTLINK_STUB_RUNNER"); logPath != "" {
 		var req runRequest
 		json.NewDecoder(os.Stdin).Decode(&req)

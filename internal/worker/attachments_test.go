@@ -128,7 +128,7 @@ func TestImagePrompt(t *testing.T) {
 	if len(got.Images) != 1 || got.Images[0].MediaType != "image/png" || got.Prompt != "" {
 		t.Fatalf("runner got %+v", got)
 	}
-	if !strings.Contains(reply, "⚠️ Not passed on to Claude: `notes.txt` (not a PNG") {
+	if !strings.Contains(reply, "⚠️ Not passed on to claude: `notes.txt` (not a PNG") {
 		t.Fatalf("reply: %q", reply)
 	}
 	if title := w.state["R1"].Sessions[0].Title; title != "(image)" {

@@ -1,5 +1,6 @@
 // Package worker pulls tasks for this device from agentlink-server, runs them with the
-// Claude Agent SDK in the room's workdir and session, and sends the result back.
+// room's harness (the Claude Agent SDK, or mirasim) in its workdir and session, and sends
+// the result back.
 //
 // Tasks and results travel sealed between this device's and the server's X25519 keys;
 // local state (identity, keys, rooms, session history) is kept encrypted in SQLite.
@@ -13,6 +14,7 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"maps"
 	"net/http"
 	"net/url"
 	"regexp"
@@ -39,11 +41,13 @@ type Session struct {
 	Workdir  string    `json:"workdir"`
 	Title    string    `json:"title"` // start of the first prompt
 	LastUsed time.Time `json:"last_used"`
+	Harness  string    `json:"harness,omitempty"` // empty: legacyHarness
 }
 
 // RoomState is what a room has selected on this device.
 type RoomState struct {
 	Workdir   string    `json:"workdir"`
+	Harness   string    `json:"harness,omitempty"`    // empty: the config's default
 	SessionID string    `json:"session_id,omitempty"` // continued by default; empty = next prompt starts one
 	Sessions  []Session `json:"sessions,omitempty"`   // most recent first
 }
@@ -78,15 +82,15 @@ type sessionLock struct {
 }
 
 type Worker struct {
-	cfg    Config
-	client *Client
-	runner Runner
-	store  *store
-	sem    chan struct{}
-	now    func() time.Time
-	wg     sync.WaitGroup
-	files  *http.Client        // downloads attachments
-	fileOK func(*url.URL) bool // which attachment links may be downloaded
+	cfg     Config
+	client  *Client
+	runners map[string]Runner // by harness name
+	store   *store
+	sem     chan struct{}
+	now     func() time.Time
+	wg      sync.WaitGroup
+	files   *http.Client        // downloads attachments
+	fileOK  func(*url.URL) bool // which attachment links may be downloaded
 
 	mu        sync.Mutex
 	id        Identity
@@ -107,7 +111,7 @@ func New(cfg Config) (*Worker, error) {
 	w := &Worker{
 		cfg:     cfg,
 		client:  NewClient(cfg.ServerURL),
-		runner:  SDK{Command: cfg.Runner, Options: cfg.SDKOptions, Timeout: cfg.timeout()},
+		runners: map[string]Runner{},
 		store:   st,
 		sem:     make(chan struct{}, cfg.MaxConcurrency),
 		now:     time.Now,
@@ -117,6 +121,9 @@ func New(cfg Config) (*Worker, error) {
 		marks:   map[string]time.Time{},
 		files:   attachmentClient,
 		fileOK:  tankaFile,
+	}
+	for name, h := range cfg.Harnesses {
+		w.runners[name] = h.runner(cfg.timeout())
 	}
 	if w.state, err = st.rooms(); err != nil {
 		return nil, err
@@ -383,14 +390,16 @@ func parseCommand(text string) command {
 		return command{name: "resume", arg: ref, prompt: p}
 	case "cd", "workdir":
 		return command{name: "cd", arg: rest}
+	case "harness":
+		return command{name: "harness", arg: rest}
 	}
 	return command{name: "prompt", prompt: strings.TrimSpace(text)}
 }
 
-// handle runs a task that may change room state or start Claude; it returns the reply.
+// handle runs a task that may change room state or start a run; it returns the reply.
 func (w *Worker) handle(ctx context.Context, t proto.Task) string {
 	if tr := w.trigger(t.Trigger); tr != nil { // the text is a prompt, never a room command
-		return w.prompt(ctx, t, Run{Workdir: tr.Workdir, Prompt: t.Text}, false)
+		return w.prompt(ctx, t, Run{Harness: w.cfg.Harness, Workdir: tr.Workdir, Prompt: t.Text}, false)
 	}
 	if s, text, ok := w.addressed(t.RoomID, t.Text); ok {
 		if text == "" && len(t.Attachments) == 0 {
@@ -399,12 +408,14 @@ func (w *Worker) handle(ctx context.Context, t proto.Task) string {
 		if _, err := resolveWorkdir(w.cfg.WorkdirRoots, "/", s.Workdir); err != nil {
 			return "Cannot continue: " + err.Error()
 		}
-		return w.prompt(ctx, t, Run{Workdir: s.Workdir, SessionID: s.ID, Resume: true, Prompt: text}, false)
+		return w.prompt(ctx, t, Run{Harness: s.harness(), Workdir: s.Workdir, SessionID: s.ID, Resume: true, Prompt: text}, false)
 	}
 	cmd := parseCommand(t.Text)
 	switch cmd.name {
 	case "cd":
 		return w.chdir(t.RoomID, cmd.arg)
+	case "harness":
+		return w.setHarness(t.RoomID, cmd.arg)
 	case "new":
 		w.mu.Lock()
 		w.roomLocked(t.RoomID).SessionID = ""
@@ -451,6 +462,26 @@ func (w *Worker) chdir(roomID, arg string) string {
 	return fmt.Sprintf("Workdir is now `%s`; the next prompt starts a new session there.", tilde(dir))
 }
 
+func (w *Worker) setHarness(roomID, name string) string {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	rs := w.roomLocked(roomID)
+	names := slices.Sorted(maps.Keys(w.cfg.Harnesses))
+	if name == "" {
+		return fmt.Sprintf("Harness is `%s`; this device has `%s`.", w.harnessLocked(rs), strings.Join(names, "`, `"))
+	}
+	if _, ok := w.cfg.Harnesses[name]; !ok {
+		return fmt.Sprintf("Harness unchanged: this device has no harness `%s`, only `%s`.", name, strings.Join(names, "`, `"))
+	}
+	rs.Harness, rs.SessionID = name, ""
+	w.saveLocked(roomID)
+	return fmt.Sprintf("Harness is now `%s`; the next prompt starts a new session with it.", name)
+}
+
+func (w *Worker) harnessLocked(rs *RoomState) string { return cmp.Or(rs.Harness, w.cfg.Harness) }
+
+func (s Session) harness() string { return cmp.Or(s.Harness, legacyHarness) }
+
 func (w *Worker) resume(roomID, ref string) (string, bool) {
 	w.mu.Lock()
 	defer w.mu.Unlock()
@@ -463,14 +494,14 @@ func (w *Worker) resume(roomID, ref string) (string, bool) {
 		if !isUUID(ref) {
 			return fmt.Sprintf("No session in this room matches `%s`; `sessions` lists them.", ref), false
 		}
-		s = Session{ID: ref, Workdir: rs.Workdir} // e.g. one started in a terminal: it runs in the current workdir
+		s = Session{ID: ref, Workdir: rs.Workdir, Harness: w.harnessLocked(rs)} // e.g. one started in a terminal: it runs in the current workdir and harness
 	}
 	if _, err := resolveWorkdir(w.cfg.WorkdirRoots, "/", s.Workdir); err != nil {
 		return "Cannot resume: " + err.Error(), false
 	}
-	rs.SessionID, rs.Workdir = s.ID, s.Workdir
+	rs.SessionID, rs.Workdir, rs.Harness = s.ID, s.Workdir, s.harness()
 	w.saveLocked(roomID)
-	return fmt.Sprintf("Resumed session `%s` in `%s`.", short(s.ID), tilde(s.Workdir)), true
+	return fmt.Sprintf("Resumed session `%s` in `%s` (`%s`).", short(s.ID), tilde(s.Workdir), s.harness()), true
 }
 
 // prompt runs run; with current it runs in the room's workdir and current session, and the
@@ -489,19 +520,26 @@ func (w *Worker) prompt(ctx context.Context, t proto.Task, run Run, current bool
 	w.mu.Lock()
 	if current {
 		rs := w.roomLocked(t.RoomID)
-		run.Workdir, run.SessionID, run.Resume = rs.Workdir, rs.SessionID, rs.SessionID != ""
+		run.Harness, run.Workdir, run.SessionID, run.Resume = w.harnessLocked(rs), rs.Workdir, rs.SessionID, rs.SessionID != ""
+		if s, ok := sessionByID(rs.Sessions, rs.SessionID); ok && s.harness() != run.Harness {
+			run.Resume = false // the default harness changed under it: one harness cannot resume another's session
+		}
 	}
 	if !run.Resume {
 		run.SessionID = newUUID()
 	}
 	w.mu.Unlock()
+	runner := w.runners[run.Harness]
+	if runner == nil {
+		return fmt.Sprintf("This device has no harness `%s` any more; `harness` lists the ones it has.", run.Harness)
+	}
 	defer w.lockSession(run.SessionID)()
 	w.mu.Lock()
 	w.running[t.ID] = running{room: t.RoomID, session: run.SessionID, since: w.now(), prompt: text}
 	w.mu.Unlock()
 
-	log.Printf("task %s: running in %s, session %s (resume=%v)", t.ID, run.Workdir, short(run.SessionID), run.Resume)
-	res, err := w.runner.Run(ctx, run)
+	log.Printf("task %s: running %s in %s, session %s (resume=%v)", t.ID, run.Harness, run.Workdir, short(run.SessionID), run.Resume)
+	res, err := runner.Run(ctx, run)
 
 	w.mu.Lock()
 	delete(w.running, t.ID)
@@ -511,7 +549,7 @@ func (w *Worker) prompt(ctx context.Context, t proto.Task, run Run, current bool
 		if current {
 			rs.SessionID = sid
 		}
-		rs.remember(Session{ID: sid, Workdir: run.Workdir, Title: preview(text, 40), LastUsed: w.now()})
+		rs.remember(Session{ID: sid, Workdir: run.Workdir, Title: preview(text, 40), LastUsed: w.now(), Harness: run.Harness})
 		w.saveLocked(t.RoomID)
 	}
 	w.mu.Unlock()
@@ -529,7 +567,7 @@ func (w *Worker) format(ctx context.Context, t proto.Task, run Run, res RunResul
 	case err != nil:
 		fmt.Fprintf(&b, "**Run failed:** %v", err)
 	case res.IsError:
-		b.WriteString("**Claude ended with an error:**\n\n" + tanka.Truncate(res.Text, w.cfg.MaxOutputChars))
+		fmt.Fprintf(&b, "**%s ended with an error:**\n\n%s", run.Harness, tanka.Truncate(res.Text, w.cfg.MaxOutputChars))
 	default:
 		b.WriteString(tanka.Truncate(res.Text, w.cfg.MaxOutputChars))
 	}
@@ -537,7 +575,7 @@ func (w *Worker) format(ctx context.Context, t proto.Task, run Run, res RunResul
 		fmt.Fprintf(&b, "\n\n⚠️ %d tool call(s) were denied by this device's permission settings.", res.Denials)
 	}
 	if len(skipped) > 0 {
-		b.WriteString("\n\n⚠️ Not passed on to Claude: " + strings.Join(skipped, ", ") + ".")
+		fmt.Fprintf(&b, "\n\n⚠️ Not passed on to %s: %s.", run.Harness, strings.Join(skipped, ", "))
 	}
 	session := "none"
 	if res.SessionID != "" || res.Stopped || run.Resume {
@@ -546,6 +584,9 @@ func (w *Worker) format(ctx context.Context, t proto.Task, run Run, res RunResul
 	b.WriteString("\n\n")
 	if t.Trigger == "" { // a trigger's room may be wider than the people who drive this device
 		fmt.Fprintf(&b, "`%s` · `%s` · ", w.id.DeviceID, tilde(run.Workdir))
+	}
+	if len(w.cfg.Harnesses) > 1 {
+		fmt.Fprintf(&b, "%s · ", run.Harness)
 	}
 	fmt.Fprintf(&b, "session `%s`", session)
 	if t.Trigger != "" && session != "none" {
@@ -576,7 +617,11 @@ func (w *Worker) query(roomID, name string) string {
 			if s.ID == rs.SessionID {
 				mark = " ← current"
 			}
-			fmt.Fprintf(&b, "%d. `%s` · `%s` · %s · %s%s\n", i+1, short(s.ID), tilde(s.Workdir), s.LastUsed.Local().Format("01-02 15:04"), s.Title, mark)
+			h := ""
+			if len(w.cfg.Harnesses) > 1 {
+				h = s.harness() + " · "
+			}
+			fmt.Fprintf(&b, "%d. `%s` · %s`%s` · %s · %s%s\n", i+1, short(s.ID), h, tilde(s.Workdir), s.LastUsed.Local().Format("01-02 15:04"), s.Title, mark)
 		}
 		if n := len(rs.Sessions) - listSessions; n > 0 {
 			fmt.Fprintf(&b, "… and %d older\n", n)
@@ -585,6 +630,7 @@ func (w *Worker) query(roomID, name string) string {
 	}
 	fmt.Fprintf(&b, "- **Device** `%s` (%s)\n", w.id.DeviceID, w.cfg.Name)
 	fmt.Fprintf(&b, "- **Workdir** `%s`\n", tilde(rs.Workdir))
+	fmt.Fprintf(&b, "- **Harness** `%s`\n", w.harnessLocked(rs))
 	if rs.SessionID == "" {
 		b.WriteString("- **Session** none yet: the next prompt starts one\n")
 	} else {
@@ -656,6 +702,14 @@ func findSession(ss []Session, ref string) (Session, bool) {
 		return Session{}, false
 	}
 	return sessionByPrefix(ss, ref)
+}
+
+func sessionByID(ss []Session, id string) (Session, bool) {
+	i := slices.IndexFunc(ss, func(s Session) bool { return s.ID == id })
+	if i < 0 {
+		return Session{}, false
+	}
+	return ss[i], true
 }
 
 func sessionByPrefix(ss []Session, ref string) (Session, bool) {

@@ -80,11 +80,12 @@ CREATE INDEX IF NOT EXISTS tasks_by_device ON tasks (device_id, seq);
 CREATE TABLE IF NOT EXISTS events (id TEXT PRIMARY KEY, seen_at INTEGER NOT NULL);
 `
 
-const helpText = `**agentlink** runs what you write on the device paired with this room, through the Claude Agent SDK.
+const helpText = `**agentlink** runs what you write on the device paired with this room, through its harness (the Claude Agent SDK, or mirasim).
 
 - ` + "`pair <device-id>`" + ` / ` + "`unpair`" + ` — bind this room to a worker (it prints its device id on start)
 - ` + "`status`" + ` — device, workdir, session, what is running
 - ` + "`cd <path>`" + ` — switch workdir (the next prompt starts a new session)
+- ` + "`harness [name]`" + ` — show or switch this room's harness (the next prompt starts a new session)
 - ` + "`new [prompt]`" + ` — start a new session
 - ` + "`sessions`" + ` — recent sessions in this room
 - ` + "`resume <n|session-id> [prompt]`" + ` — switch to an earlier session, or to one started in a terminal

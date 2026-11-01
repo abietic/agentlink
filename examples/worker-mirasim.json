@@ -1,0 +1,16 @@
+{
+  "server_url": "https://agentlink.example.com",
+  "name": "my-laptop-mirasim",
+  "bot": "mirasim",
+  "state_dir": "~/.agentlink/mirasim",
+  "allowed_users": [],
+  "workdir_roots": ["~/Code"],
+  "default_workdir": "~/Code",
+  "harness": "mirasim",
+  "harnesses": {
+    "mirasim": { "type": "mirasim", "command": ["/Users/me/.mirasim/bin/mirasim"], "agent": "claude", "route": "own" }
+  },
+  "timeout_sec": 1800,
+  "max_concurrency": 2,
+  "max_output_chars": 3500
+}

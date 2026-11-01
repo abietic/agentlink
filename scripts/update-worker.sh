@@ -5,17 +5,18 @@
 set -euo pipefail
 REPO=${AGENTLINK_REPO:-abietic/agentlink}
 HOME_DIR=${AGENTLINK_HOME:-$HOME/.agentlink}
-LABEL=${AGENTLINK_LABEL:-com.agentlink.worker}
+LABEL=${AGENTLINK_LABEL:-com.agentlink.worker} # also restarts every loaded $LABEL.* (one per extra worker config)
 case $(uname -m) in arm64) arch=arm64 ;; x86_64) arch=amd64 ;; *) echo "unsupported arch" >&2; exit 1 ;; esac
 asset=agentlink-worker-darwin-$arch
 
 tag=$(gh release view --repo "$REPO" --json tagName --jq .tagName)
 [[ $tag == "$(cat "$HOME_DIR/VERSION" 2>/dev/null)" ]] && exit 0
-pid=$(pgrep -f "$HOME_DIR/bin/agentlink-worker" | head -1 || true)
-if [[ -n $pid ]] && pgrep -P "$pid" -f runner.mjs >/dev/null; then
-  echo "$tag is out, but a run is in progress; trying again later"
-  exit 0
-fi
+for pid in $(pgrep -f "$HOME_DIR/bin/agentlink-worker" || true); do
+  if pgrep -P "$pid" -f 'runner\.mjs|ui-cli' >/dev/null; then
+    echo "$tag is out, but a run is in progress; trying again later"
+    exit 0
+  fi
+done
 
 tmp=$(mktemp -d)
 trap 'rm -rf "$tmp"' EXIT
@@ -35,5 +36,7 @@ if [[ -d $HOME_DIR/sdk ]]; then mv "$HOME_DIR/sdk" "$HOME_DIR/sdk.prev"; fi
 mv "$tmp/sdk" "$HOME_DIR/sdk"
 mv "$HOME_DIR/bin/agentlink-worker.new" "$HOME_DIR/bin/agentlink-worker"
 echo "$tag" > "$HOME_DIR/VERSION"
-launchctl kickstart -k "gui/$(id -u)/$LABEL"
+for label in $(launchctl list | awk -v l="$LABEL" '$3 == l || index($3, l ".") == 1 {print $3}'); do
+  launchctl kickstart -k "gui/$(id -u)/$label"
+done
 echo "updated to $tag"

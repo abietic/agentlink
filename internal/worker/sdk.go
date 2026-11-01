@@ -12,8 +12,9 @@ import (
 	"time"
 )
 
-// Run is one prompt for Claude.
+// Run is one prompt for a harness.
 type Run struct {
+	Harness   string // picks the runner; runners ignore it
 	Workdir   string
 	SessionID string
 	Resume    bool // continue SessionID; otherwise start a new session with that id

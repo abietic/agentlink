@@ -1,6 +1,6 @@
 # agentlink
 
-在 Tanka 群里 @ 机器人，消息就交给一台配对好的机器，由 Claude Agent SDK 在那台机器上执行，结果回帖到同一个群（挂在原消息下面）。服务端只负责收发和路由；源码、凭证和执行都留在 worker 所在的机器上。
+在 Tanka 群里 @ 机器人，消息就交给一台配对好的机器，由那台机器上的 harness（Claude Agent SDK，或 mirasim）执行，结果回帖到同一个群（挂在原消息下面）。服务端只负责收发和路由；源码、凭证和执行都留在 worker 所在的机器上。
 
 ```
 Tanka 群 ──@bot──▶ agentlink-server ◀──长轮询── agentlink-worker ──▶ node sdk/runner.mjs ──▶ Agent SDK query()
@@ -17,6 +17,28 @@ Tanka 群 ──@bot──▶ agentlink-server ◀──长轮询── agentlin
 - server 可以同时接多个 Tanka 应用（`bots`），每个的事件地址是 `POST /tanka/events/<name>`；`POST /tanka/events` 是默认机器人。
 - worker 用 `bot` 选择通过哪个机器人配对，不填就是 server 的默认机器人。设备只能在自己那个机器人所在的群里 `pair`。
 - 每台设备有独立的任务队列，多台设备同时在线互不影响；同一台设备上，每个群按顺序执行，所有群合计最多同时跑 `max_concurrency` 个。
+- 一台机器可以跑多个 worker（各自的配置文件和 `state_dir`），各自配对一个机器人，比如给 mirasim 单独一个机器人：见下面的 harness。
+
+## Harness（用什么执行）
+
+worker 配置里的 `harnesses` 列出这台设备能用的执行方式，`harness` 是默认的那个；群里发 `harness <名字>` 切换本群的，切换后下一条 prompt 新开会话。每个会话记着自己是哪个 harness 跑的，用会话 id 续接时还走原来的那个。
+
+| `type` | 怎么执行 | 配置 |
+|---|---|---|
+| `sdk`（默认） | `node sdk/runner.mjs` 调 Agent SDK 的 `query()`，见上面 | `runner`、`sdk_options`，不填就用顶层的；顶层配了 `runner` 就自动有一个叫 `claude` 的 |
+| `mirasim` | `mirasim ui-cli prompt` 交给正在运行的 mirasim（默认桌面版，端口 4970），会话出现在 mirasim 的侧栏和手机端 | `command`（默认 `["mirasim"]`）、`port`、`agent`（默认 `claude`）、`model`、`effort`、`route` |
+
+mirasim 的几点限制：
+
+- 要 mirasim 桌面版开着；没开时回帖是 ui-cli 的报错。
+- `route` 默认 `own`：用这台机器上 agent 自己的登录；`platform` 走 mirasim 的账号，prompt 和文件会经过 mirasim 的服务器。
+- 工具调用的审批按 mirasim 里 agent 的设置。轮次在等审批或提问时，worker 一直等到 `timeout_sec`，然后回帖列出在等什么，这一轮留在 mirasim 里，回答以后继续跑；没在等任何东西又超时的，会被停掉。
+- 新会话的 id 由 mirasim 分配，worker 记的是会话键里 `<agent>:` 后面那段。
+- ui-cli 不读 stdin，prompt 在命令行参数里，本机其他用户用 `ps` 能看到；以 `/` 开头的文字可能被当成 mirasim 的宿主命令（如 `/branch`）。
+- 回帖页脚没有轮数和费用。
+- 触发式任务用设备的默认 harness。
+
+给 mirasim 单独配一个机器人：在 Tanka 建第二个应用，server 的 `bots` 里加一项（事件地址 `/tanka/events/<name>`）；本机再跑一个 worker，配置见 `examples/worker-mirasim.json`，launchd 见 `examples/com.agentlink.worker.mirasim.plist`。自动更新会等所有 worker 都空闲，再一起重启（`com.agentlink.worker` 和 `com.agentlink.worker.*`）。
 
 ## 加密
 
@@ -36,6 +58,7 @@ Tanka 群 ──@bot──▶ agentlink-server ◀──长轮询── agentlin
 | `new [prompt]` | 新开会话，可以同时带上第一条 prompt |
 | `sessions` | 本群最近 15 个会话（记住 50 个） |
 | `resume <序号 \| id 前缀 \| 完整 UUID> [prompt]` | 切回旧会话；用完整 UUID 可以接手在终端里开的会话 |
+| `harness [名字]` | 查看或切换本群的 harness，切换后下一条 prompt 新开会话 |
 | `help` 或只 @ 不写内容（也不带图） | 帮助 |
 | `<会话 id 前缀> <prompt>` | 在那个会话里继续（至少 6 位，回帖页脚和 `sessions` 里有），不切换群的当前会话；不同会话可以同时跑 |
 | 其他任何内容 | 作为 prompt，在当前会话里执行 |
@@ -100,7 +123,7 @@ AGENTLINK_ENROLL_TOKEN=... agentlink-worker
 
 - 推 `v*` tag 触发 `.github/workflows/release.yml`：跑测试，构建 server（Linux amd64 / arm64）、worker（macOS arm64 / amd64）和 SDK runner 包，生成 `SHA256SUMS`，用 GitHub artifact attestation 记录构建来源，发成 Release。日常 push 和 PR 由 `ci.yml` 跑 gofmt、vet 和 `go test -race`。
 - **server**：把 `scripts/update-server.sh` 放到 `/opt/agentlink/`，装上 `examples/agentlink-update.service` 和 `.timer`（`AGENTLINK_HEALTH` 改成 server 的监听地址）。每小时检查一次：有新版本就下载、校验 sha256，再用 `gh attestation verify` 确认它是本仓库 `release.yml` 在对应 tag 上构建的（证明包从公开 API 取，不用登录 GitHub；`gh` 放在 `/opt/agentlink/bin/gh`），然后替换、重启 `agentlink-server`。任何一项校验不过就不装，正在跑的版本不受影响。`update-server.sh --check` 只下载和校验、不安装；`/healthz` 20 秒内不通就换回旧版本，之后不再重试这个版本。只动 agentlink 自己的单元。
-- **worker**：把 `scripts/update-worker.sh` 放到 `~/.agentlink/bin/`，装上 `examples/com.agentlink.update.plist`。每小时检查一次：下载 worker 和 SDK runner，校验 sha256 并用 `gh attestation verify` 确认是本仓库 `release.yml` 在对应 tag 上构建的（需要已登录的 `gh`），在 `~/.agentlink/sdk` 里 `npm ci`，等没有正在跑的 prompt 时替换并重启 worker。用自动更新时，`runner` 指向 `~/.agentlink/sdk/runner.mjs`。
+- **worker**：把 `scripts/update-worker.sh` 放到 `~/.agentlink/bin/`，装上 `examples/com.agentlink.update.plist`。每小时检查一次：下载 worker 和 SDK runner，校验 sha256 并用 `gh attestation verify` 确认是本仓库 `release.yml` 在对应 tag 上构建的（需要已登录的 `gh`），在 `~/.agentlink/sdk` 里 `npm ci`，等所有 worker 都没有正在跑的 prompt 时替换并重启它们。用自动更新时，`runner` 指向 `~/.agentlink/sdk/runner.mjs`。
 
 ## 安全模型
 
@@ -108,7 +131,7 @@ AGENTLINK_ENROLL_TOKEN=... agentlink-worker
 - **谁能驱动机器**：server 的 `allowed_users` 是可选的粗过滤；最终由 worker 本机的 `allowed_users` 决定，默认拒绝所有人。设备注册需要 enroll token。
 - **能做什么**：工作目录限制在 `workdir_roots` 之内（先解析符号链接再判断）。默认 `permissionMode: "auto"`：由模型分类器逐个批准或拒绝工具调用，判断不了的一律拒绝（没人在场回答权限询问），回复里会注明被拒绝的次数。要更严就改成 `"dontAsk"` 并用 `allowedTools` 预先放行，要更松就在 `allowedTools` 里加。群消息是不可信输入，可能被用来做 prompt 注入；分类器能挡住一部分，但不等于沙箱，`allowed_users` 要保持最小。
 - **触发任务**：只有两个来源能产生——server 的 Sentry 钩子（HMAC 校验）和设备自己（用设备密钥加密），所以不过 `allowed_users`。但告警标题等字段是外部可控的文本，同样是 prompt 注入面：模板里的字段会被压成一行并截断，prompt 里要写明它们只是数据。
-- **数据**：会话的完整记录留在 worker 本机（Claude Code 自己的 `~/.claude/projects`），群里发的图片也在里面。附件链接不用登录就能下载，所以只在加密的任务里传，不写日志、不出现在错误信息里。
+- **数据**：会话的完整记录留在 worker 本机（Claude Code 自己的 `~/.claude/projects`；mirasim harness 则在 mirasim 的存储里，mirasim 的手机端和协作空间成员按 mirasim 的权限能看到），群里发的图片也在里面。附件链接不用登录就能下载，所以只在加密的任务里传，不写日志、不出现在错误信息里。
 
 ## 开发
 

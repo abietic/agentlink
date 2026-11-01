@@ -28,7 +28,8 @@ type Config struct {
 	DefaultWorkdir string   `json:"default_workdir"` // default the first root
 
 	// Runner runs one prompt through the Claude Agent SDK, normally
-	// ["node", "<repo>/sdk/runner.mjs"] after `npm ci` in sdk/.
+	// ["node", "<repo>/sdk/runner.mjs"] after `npm ci` in sdk/. When set, it is the
+	// harness "claude" unless harnesses defines that name.
 	Runner []string `json:"runner"`
 	// SDKOptions go to the SDK's query() as options; cwd and the session are set per run.
 	// Default {"permissionMode": "auto"}: a model classifier approves or denies each tool
@@ -37,6 +38,11 @@ type Config struct {
 	TimeoutSec     int             `json:"timeout_sec"`      // per run; default 1800, keep below the server's lease_sec
 	MaxConcurrency int             `json:"max_concurrency"`  // runs at once across rooms; default 2
 	MaxOutputChars int             `json:"max_output_chars"` // reply body cap; default 3500
+
+	// Harnesses are the ways this device can run a prompt, by name (see Harness). Harness
+	// is the default one, "claude" unless set; a room switches with `harness <name>`.
+	Harnesses map[string]Harness `json:"harnesses"`
+	Harness   string             `json:"harness"`
 
 	Triggers []Trigger `json:"triggers"` // see Trigger
 }
@@ -55,9 +61,6 @@ func LoadConfig(path string) (Config, error) {
 	}
 	if c.ServerURL == "" {
 		return c, errors.New("server_url is required")
-	}
-	if len(c.Runner) == 0 {
-		return c, errors.New(`runner is required, e.g. ["node", "/path/to/agentlink/sdk/runner.mjs"]`)
 	}
 	return c, c.applyDefaults()
 }
@@ -96,6 +99,9 @@ func (c *Config) applyDefaults() error {
 	}
 	if c.MaxOutputChars <= 0 {
 		c.MaxOutputChars = 3500
+	}
+	if err := c.checkHarnesses(); err != nil {
+		return err
 	}
 	return c.checkTriggers()
 }

@@ -1,0 +1,35 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!-- A second agentlink-worker for the mirasim bot (examples/worker-mirasim.json). Replace USER, then:
+     mkdir -p ~/.agentlink/mirasim && cp examples/worker-mirasim.json ~/.agentlink/mirasim/worker.json   (edit it)
+     cp examples/com.agentlink.worker.mirasim.plist ~/Library/LaunchAgents/
+     launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.agentlink.worker.mirasim.plist
+     The first start needs AGENTLINK_ENROLL_TOKEN in EnvironmentVariables; remove it afterwards. -->
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.agentlink.worker.mirasim</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/Users/USER/.agentlink/bin/agentlink-worker</string>
+    <string>-config</string>
+    <string>/Users/USER/.agentlink/mirasim/worker.json</string>
+  </array>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <!-- launchd starts with a minimal PATH; claude and the tools it runs must be on it. -->
+    <key>PATH</key>
+    <string>/Users/USER/.local/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+  </dict>
+  <key>RunAtLoad</key>
+  <true/>
+  <key>KeepAlive</key>
+  <true/>
+  <key>ThrottleInterval</key>
+  <integer>10</integer>
+  <key>StandardOutPath</key>
+  <string>/Users/USER/.agentlink/mirasim/worker.log</string>
+  <key>StandardErrorPath</key>
+  <string>/Users/USER/.agentlink/mirasim/worker.log</string>
+</dict>
+</plist>
