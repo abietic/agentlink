@@ -16,7 +16,7 @@ import (
 // stubMirasim stands in for `mirasim ui-cli`: it logs its argv as one JSON line and answers
 // like ui-cli. The prompt "slow" never settles, "ask" waits on a question (whose details
 // `call subscribe` prints), "fail" ends in an error; anything else is echoed. A new
-// session's key is claude:<the prompt's sha-ish>.
+// session's key is claude:<the prompt's sha-ish>. The space's one human member is usr_a.
 func stubMirasim(logPath string, args []string) {
 	f, _ := os.OpenFile(logPath, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o600)
 	json.NewEncoder(f).Encode(args)
@@ -34,6 +34,14 @@ func stubMirasim(logPath string, args []string) {
 	if slices.Contains(args, "subscribe") { // the snapshot of the session "ask" left waiting
 		os.Stdout.WriteString(`{"ok":true,"frames":[{"type":"snapshot","snapshot":{"interactions":[{"promptId":"p1","kind":"user-input","title":"Claude asks",` +
 			`"questions":[{"id":"q0","text":"Red or blue?","type":"select","choices":[{"label":"Red","value":"Red"},{"label":"Blue","description":"the sky","value":"Blue"}]}]}]}}]}` + "\n")
+		return
+	}
+	if slices.Contains(args, "chatMembers") {
+		os.Stdout.WriteString(`{"ok":true,"frames":[{"type":"chatMemberList","people":[{"uid":"usr_a","role":"admin","kind":"human"},{"uid":"ai-claude","role":"member","kind":"agent"}]}]}` + "\n")
+		return
+	}
+	if slices.Contains(args, "setSessionAccess") {
+		os.Stdout.WriteString(`{"ok":true,"frames":[{"type":"sessionAccess","ok":true,"shared":true}]}` + "\n")
 		return
 	}
 	key := flag("--session")
@@ -100,6 +108,75 @@ func TestMirasimRunner(t *testing.T) {
 	calls := stubCalls(t, logPath)
 	if err != nil || !res.Stopped || !slices.Equal(calls[len(calls)-1][len(calls[len(calls)-1])-3:], []string{"stop", "--session", "claude:abc"}) {
 		t.Fatalf("timeout: %+v %v, last call %q", res, err, calls[len(calls)-1])
+	}
+}
+
+// TestMirasimMembers: a mapped sender's turn runs as their member, and while members are set
+// sessions are shared: a new one after its turn, a resumed one before. A mapping to someone
+// who is not a member runs as the owner and says so.
+func TestMirasimMembers(t *testing.T) {
+	logPath := filepath.Join(t.TempDir(), "mirasim.log")
+	t.Setenv("AGENTLINK_STUB_MIRASIM", logPath)
+	m := Mirasim{Command: []string{os.Args[0]}, Port: 4970, Agent: "claude", Route: "own", Timeout: 5 * time.Second,
+		Members: map[string]string{"U1": "usr_a", "U2": "usr_gone"}}
+	dir := t.TempDir()
+	// run returns the reply and what each ui-cli call of the run did, after the connection flags.
+	run := func(r Run) (string, []string) {
+		before := 0
+		if _, err := os.Stat(logPath); err == nil {
+			before = len(stubCalls(t, logPath))
+		}
+		res, err := m.Run(context.Background(), r)
+		if err != nil {
+			t.Fatalf("%+v: %v", r, err)
+		}
+		var calls []string
+		for _, c := range stubCalls(t, logPath)[before:] {
+			calls = append(calls, strings.Join(c[5:], " "))
+		}
+		return res.Text, calls
+	}
+	const newKey = "claude:0d1e2f30-0000-4000-8000-000000000001"
+
+	text, calls := run(Run{Workdir: dir, Prompt: "hi", UserID: "U1"})
+	if text != "mirasim: hi" || len(calls) != 3 || calls[0] != "call chatMembers --max-frames 1" ||
+		!strings.HasPrefix(calls[1], "--by usr_a prompt --text hi") ||
+		calls[2] != `call setSessionAccess --args {"sessionKey":"`+newKey+`","shared":true} --max-frames 1` {
+		t.Fatalf("mapped member: %q %q", text, calls)
+	}
+
+	text, calls = run(Run{Workdir: dir, Prompt: "hi", UserID: "U2"})
+	if !strings.HasSuffix(text, "⚠️ `usr_gone` is not a person of this mirasim space, so this turn ran as the machine's owner.") ||
+		len(calls) != 3 || !strings.HasPrefix(calls[1], "prompt --text hi") {
+		t.Fatalf("mapped to no member: %q %q", text, calls)
+	}
+
+	text, calls = run(Run{Workdir: dir, SessionID: "abc", Resume: true, Prompt: "again", UserID: "U3"})
+	if text != "mirasim: again" || len(calls) != 2 || !strings.Contains(calls[0], `"sessionKey":"claude:abc"`) ||
+		!strings.HasPrefix(calls[1], "prompt --text again") {
+		t.Fatalf("unmapped sender, resumed session: %q %q", text, calls)
+	}
+}
+
+// TestRoomTaskCarriesSender: the worker hands a room task's sender to the harness.
+func TestRoomTaskCarriesSender(t *testing.T) {
+	f := newFixture(t)
+	mlog := filepath.Join(t.TempDir(), "mirasim.log")
+	t.Setenv("AGENTLINK_STUB_MIRASIM", mlog)
+	f.cfg.Harnesses = map[string]Harness{"mirasim": {Type: "mirasim", Command: []string{os.Args[0]}, Members: map[string]string{"U1": "usr_a"}}}
+	f.cfg.Harness = "mirasim"
+	if err := f.cfg.checkHarnesses(); err != nil {
+		t.Fatal(err)
+	}
+	w, err := New(f.cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if r := w.handle(context.Background(), proto.Task{ID: "t", RoomID: "R1", UserID: "U1", Text: "hello"}); !strings.HasPrefix(r, "mirasim: hello") {
+		t.Fatalf("reply: %q", r)
+	}
+	if calls := stubCalls(t, mlog); len(calls) < 2 || !slices.Equal(calls[1][5:8], []string{"--by", "usr_a", "prompt"}) {
+		t.Fatalf("calls: %q", calls)
 	}
 }
 

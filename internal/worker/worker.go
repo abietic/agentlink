@@ -525,6 +525,9 @@ func (w *Worker) prompt(ctx context.Context, t proto.Task, run Run, current bool
 	if run.Prompt == "" && len(run.Images) == 0 {
 		return "Nothing to run: the message has no text, and its attachments were not passed on: " + strings.Join(skipped, ", ") + "."
 	}
+	if t.Trigger == "" {
+		run.UserID = t.UserID
+	}
 	text := cmp.Or(run.Prompt, "(image)")
 	w.mu.Lock()
 	if current {

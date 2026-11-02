@@ -26,7 +26,7 @@ worker 配置里的 `harnesses` 列出这台设备能用的执行方式，`harne
 | `type` | 怎么执行 | 配置 |
 |---|---|---|
 | `sdk`（默认） | `node sdk/runner.mjs` 调 Agent SDK 的 `query()`，见上面 | `runner`、`sdk_options`，不填就用顶层的；顶层配了 `runner` 就自动有一个叫 `claude` 的 |
-| `mirasim` | `mirasim ui-cli prompt` 交给正在运行的 mirasim（默认桌面版，端口 4970），会话出现在 mirasim 的侧栏和手机端 | `command`（默认 `["mirasim"]`）、`port`、`agent`（默认 `claude`）、`model`、`effort`、`route` |
+| `mirasim` | `mirasim ui-cli prompt` 交给正在运行的 mirasim（默认桌面版，端口 4970），会话出现在 mirasim 的侧栏和手机端 | `command`（默认 `["mirasim"]`）、`port`、`agent`（默认 `claude`）、`model`、`effort`、`route`、`members` |
 
 mirasim 的几点限制：
 
@@ -34,6 +34,12 @@ mirasim 的几点限制：
 - `route` 默认 `own`：用这台机器上 agent 自己的登录；`platform` 走 mirasim 的账号，prompt 和文件会经过 mirasim 的服务器。
 - 工具调用的审批按 mirasim 里 agent 的设置。mirasim 给 claude 的审批模式只有 `auto` 和 `bypassPermissions`（默认），提问工具默认关闭，所以默认设置下 claude 不会停下来等审批或提问；打开提问工具后才会。轮次在等审批或提问时，worker 一直等到 `timeout_sec`，然后回帖列出在等什么（每个问题和它的选项），这一轮留在 mirasim 里，回答以后继续跑；在超时前回答的，结果照常回帖。没在等任何东西又超时的，会被停掉。
 - 新会话的 id 由 mirasim 分配，worker 记的是会话键里 `<agent>:` 后面那段。
+- `members` 把 Tanka 用户 id 映射到 mirasim 空间里的人（`usr_…`，空间设置 › 成员），被映射的人发起的轮次记在本人名下（`ui-cli --by`）：
+  - 会话里显示发起人的名字；
+  - 轮次完成或等回答时，只通知发起人自己的手机；
+  - 发起人能用哪些模型、扣谁的额度由 mirasim 决定，本机的登录只给所有者和管理员用。
+
+  没映射的人和触发式任务仍以机器所有者身份运行。映射到的人如果不是这个空间的成员，mirasim 会悄悄按所有者执行，所以 worker 会先核对成员名单，并在回帖里说明。配了 `members` 后，worker 把每个会话都设成「与成员共享」，因为 mirasim 默认只允许会话创建者在会话里发消息。
 - ui-cli 不读 stdin，prompt 在命令行参数里，本机其他用户用 `ps` 能看到；以 `/` 开头的文字可能被当成 mirasim 的宿主命令（如 `/branch`）。
 - 回帖页脚没有轮数和费用。
 - 触发式任务用设备的默认 harness。

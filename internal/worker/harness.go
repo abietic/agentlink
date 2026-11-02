@@ -10,6 +10,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"slices"
 	"strconv"
 	"strings"
 	"time"
@@ -37,6 +38,13 @@ type Harness struct {
 	// Route is "own" (default: the agent's own sign-in on this machine) or "platform"
 	// (mirasim's account, so prompts and files pass through mirasim's servers).
 	Route string `json:"route"`
+	// Members maps Tanka user ids to people of this mirasim space (their "usr_…" id), so a
+	// mapped sender's turn is theirs: it carries their name, and only their phone is told
+	// when it finishes or waits on an answer. mirasim decides which models and credit they
+	// may use; this machine's own sign-ins serve only its owner and admins. Everyone else,
+	// and triggers, run as the owner. While members are set, every session is shared with
+	// the space, since otherwise only a session's creator may send in it.
+	Members map[string]string `json:"members"`
 }
 
 func (c *Config) checkHarnesses() error {
@@ -84,7 +92,7 @@ func (c *Config) checkHarnesses() error {
 
 func (h Harness) runner(timeout time.Duration) Runner {
 	if h.Type == "mirasim" {
-		return Mirasim{Command: h.Command, Port: h.Port, Agent: h.Agent, Model: h.Model, Effort: h.Effort, Route: h.Route, Timeout: timeout}
+		return Mirasim{Command: h.Command, Port: h.Port, Agent: h.Agent, Model: h.Model, Effort: h.Effort, Route: h.Route, Members: h.Members, Timeout: timeout}
 	}
 	return SDK{Command: h.Runner, Options: h.SDKOptions, Timeout: timeout}
 }
@@ -99,6 +107,7 @@ type Mirasim struct {
 	Command                     []string
 	Port                        int
 	Agent, Model, Effort, Route string
+	Members                     map[string]string
 	Timeout                     time.Duration
 }
 
@@ -127,9 +136,18 @@ type mirasimInteraction struct {
 }
 
 func (m Mirasim) Run(ctx context.Context, r Run) (RunResult, error) {
-	args := []string{"prompt", "--text", cmp.Or(r.Prompt, "See the attached image."), "--agent", m.Agent, "--cwd", r.Workdir, "--route", m.Route, "--quiet"}
+	by, note := m.person(r.UserID)
+	var args []string
+	if by != "" {
+		args = append(args, "--by", by)
+	}
+	args = append(args, "prompt", "--text", cmp.Or(r.Prompt, "See the attached image."), "--agent", m.Agent, "--cwd", r.Workdir, "--route", m.Route, "--quiet")
+	var shareErr error
 	if r.Resume {
 		args = append(args, "--session", m.Agent+":"+r.SessionID)
+		if len(m.Members) > 0 { // it may predate members, or have been started in mirasim
+			shareErr = m.share(m.Agent + ":" + r.SessionID)
+		}
 	}
 	if m.Model != "" {
 		args = append(args, "--model", m.Model)
@@ -164,6 +182,12 @@ func (m Mirasim) Run(ctx context.Context, r Run) (RunResult, error) {
 		return res, cmp.Or(runErr, fmt.Errorf("mirasim printed no result: %s", lastBytes(bytes.TrimSpace(stdout), 400)))
 	}
 	res.SessionID = strings.TrimPrefix(out.SessionKey, m.Agent+":")
+	if len(m.Members) > 0 && !r.Resume {
+		shareErr = m.share(out.SessionKey)
+	}
+	if shareErr != nil {
+		note += fmt.Sprintf("\n\n⚠️ This session is not shared with the mirasim space (%v), so only whoever started it can send in it.", shareErr)
+	}
 	switch {
 	case len(out.Interactions) > 0: // left running: someone can answer it in mirasim
 		items := m.pending(out.SessionKey)
@@ -184,7 +208,74 @@ func (m Mirasim) Run(ctx context.Context, r Run) (RunResult, error) {
 			res.Text, res.IsError = strings.TrimSpace(out.Text+"\n\n"+e), true
 		}
 	}
+	res.Text += note
 	return res, nil
+}
+
+// person returns who a sender's turn runs as: the member they map to, or "" for the machine's
+// owner. mirasim runs a turn named for anyone who is not a person of the space as the owner
+// without saying so, so a mapping to no member comes back with a note instead.
+func (m Mirasim) person(userID string) (by, note string) {
+	uid := m.Members[userID]
+	if uid == "" {
+		return "", ""
+	}
+	if people, err := m.people(); err == nil && !slices.Contains(people, uid) {
+		return "", fmt.Sprintf("\n\n⚠️ `%s` is not a person of this mirasim space, so this turn ran as the machine's owner.", uid)
+	}
+	return uid, "" // if the list cannot be read, mirasim still decides
+}
+
+// people lists the user ids of the space's human members, as mirasim looks them up for --by.
+func (m Mirasim) people() ([]string, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	stdout, err := m.uiCLI(ctx, 15*time.Second, "call", "chatMembers", "--max-frames", "1")
+	var out struct {
+		Frames []struct {
+			People []struct {
+				UID  string `json:"uid"`
+				Kind string `json:"kind"`
+			} `json:"people"`
+		} `json:"frames"`
+	}
+	if err != nil {
+		return nil, err
+	}
+	if json.Unmarshal(stdout, &out) != nil || len(out.Frames) == 0 {
+		return nil, errors.New("mirasim listed no members")
+	}
+	var uids []string
+	for _, p := range out.Frames[0].People {
+		if p.Kind == "human" {
+			uids = append(uids, p.UID)
+		}
+	}
+	return uids, nil
+}
+
+// share opens a session to every member of the space; the machine's owner may do that for
+// anyone's session.
+func (m Mirasim) share(key string) error {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	args, _ := json.Marshal(map[string]any{"sessionKey": key, "shared": true})
+	stdout, err := m.uiCLI(ctx, 15*time.Second, "call", "setSessionAccess", "--args", string(args), "--max-frames", "1")
+	var out struct {
+		Frames []struct {
+			OK    bool            `json:"ok"`
+			Error json.RawMessage `json:"error"`
+		} `json:"frames"`
+	}
+	switch {
+	case err != nil:
+		return err
+	case json.Unmarshal(stdout, &out) != nil || len(out.Frames) == 0:
+		return errors.New("mirasim did not answer")
+	case !out.Frames[0].OK:
+		return errors.New(cmp.Or(errorText(out.Frames[0].Error), "refused"))
+	}
+	return nil
 }
 
 // pending reads the session's open interactions with their questions from its snapshot, or

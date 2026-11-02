@@ -20,6 +20,7 @@ type Run struct {
 	Resume    bool // continue SessionID; otherwise start a new session with that id
 	Prompt    string
 	Images    []Image // go in the same message as Prompt, before it
+	UserID    string  // the Tanka user who sent it; empty for triggers
 }
 
 type RunResult struct {
