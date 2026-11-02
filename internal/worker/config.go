@@ -23,6 +23,11 @@ type Config struct {
 	// AllowedUsers are the Tanka user ids that may drive this device. Everyone else is
 	// refused, with their id in the reply so it can be added here.
 	AllowedUsers []string `json:"allowed_users"`
+	// AllowedBots are the Tanka user ids of other bots that may drive this device, so one
+	// agent can hand work to another by mentioning it. Replies do not mention a bot back:
+	// an agent hands on only by mentioning the next bot itself, so two bots cannot keep
+	// triggering each other.
+	AllowedBots []string `json:"allowed_bots"`
 	// WorkdirRoots bound `cd`: a workdir must be one of these or inside one. Default ~/Code.
 	WorkdirRoots   []string `json:"workdir_roots"`
 	DefaultWorkdir string   `json:"default_workdir"` // default the first root

@@ -32,7 +32,7 @@ mirasim 的几点限制：
 
 - 要 mirasim 桌面版开着；没开时回帖是 ui-cli 的报错。
 - `route` 默认 `own`：用这台机器上 agent 自己的登录；`platform` 走 mirasim 的账号，prompt 和文件会经过 mirasim 的服务器。
-- 工具调用的审批按 mirasim 里 agent 的设置。轮次在等审批或提问时，worker 一直等到 `timeout_sec`，然后回帖列出在等什么，这一轮留在 mirasim 里，回答以后继续跑；没在等任何东西又超时的，会被停掉。
+- 工具调用的审批按 mirasim 里 agent 的设置。mirasim 给 claude 的审批模式只有 `auto` 和 `bypassPermissions`（默认），提问工具默认关闭，所以默认设置下 claude 不会停下来等审批或提问；打开提问工具后才会。轮次在等审批或提问时，worker 一直等到 `timeout_sec`，然后回帖列出在等什么（每个问题和它的选项），这一轮留在 mirasim 里，回答以后继续跑；在超时前回答的，结果照常回帖。没在等任何东西又超时的，会被停掉。
 - 新会话的 id 由 mirasim 分配，worker 记的是会话键里 `<agent>:` 后面那段。
 - ui-cli 不读 stdin，prompt 在命令行参数里，本机其他用户用 `ps` 能看到；以 `/` 开头的文字可能被当成 mirasim 的宿主命令（如 `/branch`）。
 - 回帖页脚没有轮数和费用。
@@ -128,7 +128,8 @@ AGENTLINK_ENROLL_TOKEN=... agentlink-worker
 ## 安全模型
 
 - **入口**：每个事件都要通过对应机器人的 HMAC 签名校验（±5 分钟）；配了 `app_id` 的机器人还要求 `api_app_id` 一致；`event_id` 去重（持久化，重启后也不会重复执行）；`response_url` 只接受 `response_url_prefix` 开头的地址。
-- **谁能驱动机器**：server 的 `allowed_users` 是可选的粗过滤；最终由 worker 本机的 `allowed_users` 决定，默认拒绝所有人。设备注册需要 enroll token。
+- **谁能驱动机器**：server 的 `allowed_users` 是可选的粗过滤；最终由 worker 本机的 `allowed_users`（人）和 `allowed_bots`（别的机器人）决定，默认拒绝所有人。设备注册需要 enroll token。
+- **机器人之间交接**：`allowed_bots` 里的机器人 @ 本机器人时照常执行，用来让一个 agent 把工作交给另一个。回帖不会 @ 回这个机器人，被拒绝的发送者也不会被 @，所以两个机器人不会因为互相 @ 而反复触发；要交回去，得由 agent 在自己的回复里明确 @ 下一个机器人。注意：截至 2026-11-02，Tanka 不投递机器人或 webhook 发出的 @（群里显示为真 @，但不产生 `app_mention`），这个配置要等 Tanka 放开后才生效。
 - **能做什么**：工作目录限制在 `workdir_roots` 之内（先解析符号链接再判断）。默认 `permissionMode: "auto"`：由模型分类器逐个批准或拒绝工具调用，判断不了的一律拒绝（没人在场回答权限询问），回复里会注明被拒绝的次数。要更严就改成 `"dontAsk"` 并用 `allowedTools` 预先放行，要更松就在 `allowedTools` 里加。群消息是不可信输入，可能被用来做 prompt 注入；分类器能挡住一部分，但不等于沙箱，`allowed_users` 要保持最小。
 - **触发任务**：只有两个来源能产生——server 的 Sentry 钩子（HMAC 校验）和设备自己（用设备密钥加密），所以不过 `allowed_users`。但告警标题等字段是外部可控的文本，同样是 prompt 注入面：模板里的字段会被压成一行并截断，prompt 里要写明它们只是数据。
 - **数据**：会话的完整记录留在 worker 本机（Claude Code 自己的 `~/.claude/projects`；mirasim harness 则在 mirasim 的存储里，mirasim 的手机端和协作空间成员按 mirasim 的权限能看到），群里发的图片也在里面。附件链接不用登录就能下载，所以只在加密的任务里传，不写日志、不出现在错误信息里。

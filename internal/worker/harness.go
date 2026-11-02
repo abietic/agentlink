@@ -104,15 +104,26 @@ type Mirasim struct {
 
 // mirasimReply is what `ui-cli prompt` prints.
 type mirasimReply struct {
-	SessionKey   string          `json:"sessionKey"`
-	Phase        string          `json:"phase"`
-	Text         string          `json:"text"`
-	Error        json.RawMessage `json:"error"`
-	Settled      bool            `json:"settled"`
-	Interactions []struct {
-		Kind  string `json:"kind"`
-		Title string `json:"title"`
-	} `json:"interactions"`
+	SessionKey   string               `json:"sessionKey"`
+	Phase        string               `json:"phase"`
+	Text         string               `json:"text"`
+	Error        json.RawMessage      `json:"error"`
+	Settled      bool                 `json:"settled"`
+	Interactions []mirasimInteraction `json:"interactions"`
+}
+
+// mirasimInteraction is a permission request or question a turn waits on. ui-cli prompt
+// prints only its kind and title; the session snapshot also carries the questions.
+type mirasimInteraction struct {
+	Kind      string `json:"kind"`
+	Title     string `json:"title"`
+	Questions []struct {
+		Text    string `json:"text"`
+		Choices []struct {
+			Label       string `json:"label"`
+			Description string `json:"description"`
+		} `json:"choices"`
+	} `json:"questions"`
 }
 
 func (m Mirasim) Run(ctx context.Context, r Run) (RunResult, error) {
@@ -155,12 +166,11 @@ func (m Mirasim) Run(ctx context.Context, r Run) (RunResult, error) {
 	res.SessionID = strings.TrimPrefix(out.SessionKey, m.Agent+":")
 	switch {
 	case len(out.Interactions) > 0: // left running: someone can answer it in mirasim
-		var b strings.Builder
-		b.WriteString("Waiting for an answer in mirasim; the turn goes on there once it is answered:")
-		for _, it := range out.Interactions {
-			fmt.Fprintf(&b, "\n- %s: %s", it.Kind, it.Title)
+		items := m.pending(out.SessionKey)
+		if len(items) == 0 {
+			items = out.Interactions
 		}
-		res.Text = b.String()
+		res.Text = waitingText(items)
 	case !out.Settled:
 		res.Stopped = true
 		stopCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
@@ -175,6 +185,46 @@ func (m Mirasim) Run(ctx context.Context, r Run) (RunResult, error) {
 		}
 	}
 	return res, nil
+}
+
+// pending reads the session's open interactions with their questions from its snapshot, or
+// nil if that fails.
+func (m Mirasim) pending(key string) []mirasimInteraction {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	args, _ := json.Marshal(map[string]string{"sessionKey": key})
+	stdout, err := m.uiCLI(ctx, 15*time.Second, "call", "subscribe", "--args", string(args), "--max-frames", "1")
+	var out struct {
+		Frames []struct {
+			Snapshot struct {
+				Interactions []mirasimInteraction `json:"interactions"`
+			} `json:"snapshot"`
+		} `json:"frames"`
+	}
+	if err != nil || json.Unmarshal(stdout, &out) != nil || len(out.Frames) == 0 {
+		return nil
+	}
+	return out.Frames[0].Snapshot.Interactions
+}
+
+func waitingText(items []mirasimInteraction) string {
+	var b strings.Builder
+	b.WriteString("Waiting for an answer in mirasim; the turn goes on there once it is answered:")
+	for _, it := range items {
+		if len(it.Questions) == 0 {
+			fmt.Fprintf(&b, "\n- %s: %s", it.Kind, it.Title)
+		}
+		for _, q := range it.Questions {
+			fmt.Fprintf(&b, "\n- %s: %s", it.Title, q.Text)
+			for _, c := range q.Choices {
+				fmt.Fprintf(&b, "\n  - %s", c.Label)
+				if c.Description != "" {
+					fmt.Fprintf(&b, " (%s)", c.Description)
+				}
+			}
+		}
+	}
+	return b.String()
 }
 
 // uiCLI runs one ui-cli command against this harness's mirasim and returns its stdout.

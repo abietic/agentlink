@@ -182,8 +182,8 @@ func (w *Worker) Register(ctx context.Context) error {
 
 // Run polls for tasks until ctx ends, then waits for running tasks to report back.
 func (w *Worker) Run(ctx context.Context) error {
-	if len(w.cfg.AllowedUsers) == 0 {
-		log.Printf("allowed_users is empty: every task is refused, and the reply shows the sender's id")
+	if len(w.cfg.AllowedUsers)+len(w.cfg.AllowedBots) == 0 {
+		log.Printf("allowed_users and allowed_bots are empty: every task is refused, and the reply shows the sender's id")
 	}
 	for _, tr := range w.cfg.Triggers {
 		if len(tr.Command) > 0 {
@@ -239,9 +239,10 @@ func (w *Worker) dispatch(ctx context.Context, t proto.Task) {
 			go w.send(t, "") // posts nothing
 			return
 		}
-	} else if !slices.Contains(w.cfg.AllowedUsers, t.UserID) {
-		log.Printf("task %s: user %s is not in allowed_users", t.ID, t.UserID)
-		go w.send(t, fmt.Sprintf("User `%s` may not use device `%s`. Its owner can add that id to `allowed_users` in the worker config.", t.UserID, w.id.DeviceID))
+	} else if !slices.Contains(w.cfg.AllowedUsers, t.UserID) && !slices.Contains(w.cfg.AllowedBots, t.UserID) {
+		log.Printf("task %s: user %s is in neither allowed_users nor allowed_bots", t.ID, t.UserID)
+		// Not mentioned: the sender may be a bot, which would answer the mention with its own refusal.
+		go w.post(t, fmt.Sprintf("User `%s` may not use device `%s`. Its owner can add that id to `allowed_users` (a person) or `allowed_bots` (a bot) in the worker config.", t.UserID, w.id.DeviceID))
 		return
 	} else if cmd := parseCommand(t.Text); cmd.name == "status" || cmd.name == "sessions" {
 		go w.send(t, w.query(t.RoomID, cmd.name)) // read-only, so it answers even while a prompt runs
@@ -337,9 +338,17 @@ func (w *Worker) lockSession(sid string) func() {
 	}
 }
 
-// send seals and posts a result, retrying only when the request may not have reached the server.
+// send posts a reply that mentions its sender, unless the sender is a bot (see AllowedBots).
 func (w *Worker) send(t proto.Task, text string) {
-	plain, _ := json.Marshal(proto.Result{Text: mentionSender(t, text)})
+	if !slices.Contains(w.cfg.AllowedBots, t.UserID) {
+		text = mentionSender(t, text)
+	}
+	w.post(t, text)
+}
+
+// post seals and posts a result, retrying only when the request may not have reached the server.
+func (w *Worker) post(t proto.Task, text string) {
+	plain, _ := json.Marshal(proto.Result{Text: text})
 	sealed, err := seal.Seal(w.key, w.serverKey, proto.ResultContext(w.id.DeviceID, t.ID), plain)
 	if err != nil {
 		log.Printf("task %s: seal result: %v", t.ID, err)

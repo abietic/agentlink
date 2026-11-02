@@ -14,8 +14,9 @@ import (
 )
 
 // stubMirasim stands in for `mirasim ui-cli`: it logs its argv as one JSON line and answers
-// like ui-cli. The prompt "slow" never settles, "ask" waits on a permission, "fail" ends in
-// an error; anything else is echoed. A new session's key is claude:<the prompt's sha-ish>.
+// like ui-cli. The prompt "slow" never settles, "ask" waits on a question (whose details
+// `call subscribe` prints), "fail" ends in an error; anything else is echoed. A new
+// session's key is claude:<the prompt's sha-ish>.
 func stubMirasim(logPath string, args []string) {
 	f, _ := os.OpenFile(logPath, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o600)
 	json.NewEncoder(f).Encode(args)
@@ -28,6 +29,11 @@ func stubMirasim(logPath string, args []string) {
 	}
 	if slices.Contains(args, "stop") {
 		os.Stdout.WriteString(`{"stopped":true}` + "\n")
+		return
+	}
+	if slices.Contains(args, "subscribe") { // the snapshot of the session "ask" left waiting
+		os.Stdout.WriteString(`{"ok":true,"frames":[{"type":"snapshot","snapshot":{"interactions":[{"promptId":"p1","kind":"user-input","title":"Claude asks",` +
+			`"questions":[{"id":"q0","text":"Red or blue?","type":"select","choices":[{"label":"Red","value":"Red"},{"label":"Blue","description":"the sky","value":"Blue"}]}]}]}}]}` + "\n")
 		return
 	}
 	key := flag("--session")
@@ -86,7 +92,7 @@ func TestMirasimRunner(t *testing.T) {
 	}
 
 	res, err = m.Run(context.Background(), Run{Workdir: dir, SessionID: "abc", Resume: true, Prompt: "ask"})
-	if err != nil || res.Stopped || !strings.Contains(res.Text, "permission: Run git push?") {
+	if err != nil || res.Stopped || !strings.HasSuffix(res.Text, "\n- Claude asks: Red or blue?\n  - Red\n  - Blue (the sky)") {
 		t.Fatalf("waiting on an answer: %+v %v", res, err)
 	}
 

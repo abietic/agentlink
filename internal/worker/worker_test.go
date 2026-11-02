@@ -350,6 +350,8 @@ func TestEndToEnd(t *testing.T) {
 	const member = "6a7d7188238a191436b929da" // shaped like a Tanka member id, so replies mention it
 	f.cfg.ServerURL, f.cfg.EnrollToken = hs.URL, "enroll"
 	f.cfg.AllowedUsers = append(f.cfg.AllowedUsers, member)
+	const bot = "6a7d7188238a191436b929db" // another agent's bot, allowed to hand work to this device
+	f.cfg.AllowedBots = []string{bot}
 	w, err := New(f.cfg)
 	if err != nil {
 		t.Fatal(err)
@@ -402,6 +404,12 @@ func TestEndToEnd(t *testing.T) {
 	}
 	if r := say(member, "who asked"); !strings.HasPrefix(r, "<@"+member+">\n\necho: who asked") {
 		t.Fatalf("reply to a member does not mention them first: %q", r)
+	}
+	if r := say(bot, "handed on"); !strings.HasPrefix(r, "echo: handed on") {
+		t.Fatalf("a bot is refused or mentioned back: %q", r)
+	}
+	if r := say("6a7d7188238a191436b929dc", "hi"); strings.Contains(r, "<@") || !strings.Contains(r, "may not use device") {
+		t.Fatalf("a refused sender is mentioned: %q", r)
 	}
 	if r := say("U1", "status"); !strings.Contains(r, "**Workdir** `") {
 		t.Fatalf("status: %q", r)
