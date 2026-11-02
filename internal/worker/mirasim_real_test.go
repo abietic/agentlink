@@ -61,6 +61,10 @@ func TestRealMirasimMembers(t *testing.T) {
 		Members: map[string]string{"U1": member, "U2": "usr_00000000000000000000000000000000"}}
 	dir := t.TempDir()
 	ctx := context.Background()
+	t.Cleanup(func() { // a turn's --cwd registers the folder as a workspace; leave only its sessions
+		args, _ := json.Marshal(map[string]string{"path": dir})
+		m.uiCLI(ctx, 30*time.Second, "call", "removeWorkspace", "--args", string(args), "--max-frames", "1")
+	})
 
 	res, err := m.Run(ctx, Run{Workdir: dir, SessionID: newUUID(), Prompt: "Reply with just OK.", UserID: "U1"})
 	if err != nil || res.IsError || strings.Contains(res.Text, "⚠️") {
