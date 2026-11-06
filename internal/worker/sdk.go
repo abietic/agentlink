@@ -32,6 +32,7 @@ type RunResult struct {
 	Denials   int
 	CostUSD   float64
 	Duration  time.Duration
+	Limit     *Limit // the run stopped at this usage limit
 }
 
 type Runner interface {
@@ -58,6 +59,10 @@ type runReply struct {
 	NumTurns     int     `json:"num_turns"`
 	TotalCostUSD float64 `json:"total_cost_usd"`
 	Denials      int     `json:"denials"`
+	RateLimit    *struct {
+		Type     string `json:"type"`
+		ResetsAt int64  `json:"resets_at"` // epoch seconds; 0 if unknown
+	} `json:"rate_limit"`
 }
 
 // SDK runs each prompt through the Claude Agent SDK's query(): Command (normally
@@ -90,6 +95,12 @@ func (c SDK) Run(ctx context.Context, r Run) (RunResult, error) {
 	var out runReply
 	if json.Unmarshal(lastLine(stdout.Bytes()), &out) == nil {
 		res.SessionID = out.SessionID
+		if l := out.RateLimit; l != nil {
+			res.Limit = &Limit{Name: l.Type}
+			if l.ResetsAt > 0 {
+				res.Limit.ResetsAt = time.Unix(l.ResetsAt, 0)
+			}
+		}
 		if out.Type == "result" {
 			res.Text, res.IsError = out.Text, out.IsError
 			res.Turns, res.CostUSD, res.Denials = out.NumTurns, out.TotalCostUSD, out.Denials

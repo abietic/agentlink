@@ -66,12 +66,7 @@ func (s *Server) handleSentry(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if id := r.Header.Get("Request-ID"); id != "" {
-		first, err := s.firstSeen("sentry/" + bot.Name + "/" + id)
-		if err != nil {
-			http.Error(w, "storage error", http.StatusInternalServerError)
-			return
-		}
-		if !first {
+		if !s.firstSeen("sentry/"+bot.Name+"/"+id, dedupeTTL) {
 			w.WriteHeader(http.StatusOK)
 			return
 		}

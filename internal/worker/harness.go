@@ -21,8 +21,13 @@ const legacyHarness = "claude"
 
 // Harness is one way to run a prompt, chosen per room with `harness <name>`.
 type Harness struct {
-	// Type is "sdk" (the Claude Agent SDK through runner, the default) or "mirasim".
+	// Type is "sdk" (the Claude Agent SDK through runner, the default), "mirasim" or "kimi".
 	Type string `json:"type"`
+
+	// Fallback names the harnesses that take a prompt, in order, while this one is at a
+	// usage limit or cannot start. A fallback starts a new session: one harness cannot
+	// continue another's.
+	Fallback []string `json:"fallback"`
 
 	// sdk: Runner and SDKOptions default to the config's top-level runner and sdk_options.
 	Runner     []string        `json:"runner"`
@@ -30,10 +35,10 @@ type Harness struct {
 
 	// mirasim: runs the turn in a running mirasim (the desktop app by default) through
 	// `mirasim ui-cli`, so it shows up in mirasim's sidebar and on its phone app.
-	Command []string `json:"command"` // default ["mirasim"]
+	Command []string `json:"command"` // default ["mirasim"]; kimi: ["kimi"]
 	Port    int      `json:"port"`    // default 4970, the desktop app; `ls ~/.mirasim/run/` lists others
 	Agent   string   `json:"agent"`   // default "claude"
-	Model   string   `json:"model"`
+	Model   string   `json:"model"`   // mirasim and kimi: empty is their own default
 	Effort  string   `json:"effort"`
 	// Route is "own" (default: the agent's own sign-in on this machine) or "platform"
 	// (mirasim's account, so prompts and files pass through mirasim's servers).
@@ -75,10 +80,21 @@ func (c *Config) checkHarnesses() error {
 			if h.Route = cmp.Or(h.Route, "own"); h.Route != "own" && h.Route != "platform" {
 				return fmt.Errorf(`harness %q: route must be "own" or "platform"`, name)
 			}
+		case "kimi":
+			if len(h.Command) == 0 {
+				h.Command = []string{"kimi"}
+			}
 		default:
-			return fmt.Errorf(`harness %q: type must be "sdk" or "mirasim"`, name)
+			return fmt.Errorf(`harness %q: type must be "sdk", "mirasim" or "kimi"`, name)
 		}
 		c.Harnesses[name] = h
+	}
+	for name, h := range c.Harnesses {
+		for _, f := range h.Fallback {
+			if _, ok := c.Harnesses[f]; !ok || f == name {
+				return fmt.Errorf("harness %q: fallback %q is not another harness", name, f)
+			}
+		}
 	}
 	if len(c.Harnesses) == 0 {
 		return errors.New(`runner is required, e.g. ["node", "/path/to/agentlink/sdk/runner.mjs"], unless harnesses are set`)
@@ -91,8 +107,11 @@ func (c *Config) checkHarnesses() error {
 }
 
 func (h Harness) runner(timeout time.Duration) Runner {
-	if h.Type == "mirasim" {
+	switch h.Type {
+	case "mirasim":
 		return Mirasim{Command: h.Command, Port: h.Port, Agent: h.Agent, Model: h.Model, Effort: h.Effort, Route: h.Route, Members: h.Members, Timeout: timeout}
+	case "kimi":
+		return Kimi{Command: h.Command, Model: h.Model, Timeout: timeout}
 	}
 	return SDK{Command: h.Runner, Options: h.SDKOptions, Timeout: timeout}
 }

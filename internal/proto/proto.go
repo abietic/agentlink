@@ -25,6 +25,8 @@ type Task struct {
 	// Attachments sent with the mention. The worker downloads the images among them; the
 	// server only passes the links on, sealed, since anyone holding one can download it.
 	Attachments []Attachment `json:"attachments,omitempty"`
+	// Reply is the Envelope's Reply, kept by the worker to send back with the result.
+	Reply []byte `json:"-"`
 }
 
 type Attachment struct {
@@ -56,6 +58,9 @@ type TriggerBody struct {
 type Envelope struct {
 	ID     string `json:"id"`
 	Sealed []byte `json:"sealed"`
+	// Reply says where a task's result goes, boxed with the server's storage key. The server
+	// sends it with a task and forgets the task; the worker sends it back with the result.
+	Reply []byte `json:"reply,omitempty"`
 }
 
 func TaskContext(deviceID, taskID string) string    { return "task " + deviceID + " " + taskID }

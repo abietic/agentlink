@@ -140,13 +140,14 @@ func api(t *testing.T, method, url, token string, in any, out any) int {
 // testDevice is a worker as the server sees it: registered with its own key pair.
 type testDevice struct {
 	proto.RegisterResponse
-	key  *ecdh.PrivateKey
-	base string
+	key     *ecdh.PrivateKey
+	base    string
+	replies map[string][]byte // each task's Envelope.Reply, sent back with its result
 }
 
 func register(t *testing.T, base, bot string) *testDevice {
 	t.Helper()
-	d := &testDevice{key: seal.NewPrivateKey(), base: base}
+	d := &testDevice{key: seal.NewPrivateKey(), base: base, replies: map[string][]byte{}}
 	req := proto.RegisterRequest{Name: "laptop", Bot: bot, PublicKey: d.key.PublicKey().Bytes()}
 	if code := api(t, http.MethodPost, base+"/api/v1/register", "enroll", req, &d.RegisterResponse); code != http.StatusOK {
 		t.Fatalf("register: HTTP %d", code)
@@ -172,11 +173,17 @@ func (d *testDevice) poll(t *testing.T) *proto.Task {
 	}
 	var task proto.Task
 	json.Unmarshal(plain, &task)
+	d.replies[env.ID] = env.Reply
 	return &task
 }
 
-// result seals text with sender (normally the device key) and posts it.
+// result seals text with sender (normally the device key) and posts it with the task's Reply.
 func (d *testDevice) result(t *testing.T, sender *ecdh.PrivateKey, taskID, text string) int {
+	t.Helper()
+	return d.resultWith(t, sender, taskID, text, d.replies[taskID])
+}
+
+func (d *testDevice) resultWith(t *testing.T, sender *ecdh.PrivateKey, taskID, text string, reply []byte) int {
 	t.Helper()
 	serverKey, _ := seal.ParsePublicKey(d.ServerKey)
 	plain, _ := json.Marshal(proto.Result{Text: text})
@@ -184,7 +191,7 @@ func (d *testDevice) result(t *testing.T, sender *ecdh.PrivateKey, taskID, text 
 	if err != nil {
 		t.Fatal(err)
 	}
-	return api(t, http.MethodPost, d.base+"/api/v1/tasks/"+taskID+"/result", d.DeviceToken, proto.Envelope{ID: taskID, Sealed: sealed}, nil)
+	return api(t, http.MethodPost, d.base+"/api/v1/tasks/"+taskID+"/result", d.DeviceToken, proto.Envelope{ID: taskID, Sealed: sealed, Reply: reply}, nil)
 }
 
 func TestURLVerificationAndSignatures(t *testing.T) {
@@ -266,7 +273,7 @@ func TestMentionRoutingAndResult(t *testing.T) {
 	if code := dev.result(t, seal.NewPrivateKey(), task.ID, "forged"); code != http.StatusBadRequest {
 		t.Fatalf("result sealed with another key: HTTP %d, want 400", code)
 	}
-	if code := dev.result(t, dev.key, task.ID, "done"); code != http.StatusOK {
+	if code := dev.resultWith(t, dev.key, task.ID, "done", nil); code != http.StatusOK { // a worker from before Reply
 		t.Fatalf("result: HTTP %d", code)
 	}
 	if p := ft.next(t); p.text != "done" || p.path != "/hooks/response/tok" {
@@ -335,14 +342,29 @@ func TestDevicesQueueIndependently(t *testing.T) {
 	}
 }
 
-func TestStateSurvivesRestartEncrypted(t *testing.T) {
+// TestRestartKeepsNoMessages checks that tasks never reach the disk, and that a device that
+// took a task before a restart can still post its result after it.
+func TestRestartKeepsNoMessages(t *testing.T) {
 	s, base, ft := newTestServer(t, nil)
 	dev := register(t, base, "")
 	sendEvent(t, base, mention(ft, "R1", "U1", "@Agent Link pair "+dev.DeviceID))
 	ft.next(t)
 	dev.poll(t)
 	sendEvent(t, base, mention(ft, "R1", "U1", "@Agent Link kiwi-canary"))
+	taken := dev.poll(t)
+	if taken == nil || taken.Text != "kiwi-canary" {
+		t.Fatalf("task = %+v", taken)
+	}
+	sendEvent(t, base, mention(ft, "R1", "U1", "@Agent Link plum-canary")) // still waiting at the restart
 	s.Close()
+	for _, p := range []string{s.cfg.DBPath, s.cfg.DBPath + "-wal"} {
+		b, _ := os.ReadFile(p)
+		for _, plain := range []string{"kiwi-canary", "plum-canary", dev.DeviceToken, "/hooks/response/tok"} {
+			if bytes.Contains(b, []byte(plain)) {
+				t.Errorf("%s holds %q", filepath.Base(p), plain)
+			}
+		}
+	}
 
 	s2, err := New(s.cfg)
 	if err != nil {
@@ -352,16 +374,25 @@ func TestStateSurvivesRestartEncrypted(t *testing.T) {
 	hs := httptest.NewServer(s2.Handler())
 	defer hs.Close()
 	dev.base = hs.URL
-	if task := dev.poll(t); task == nil || task.Text != "kiwi-canary" {
-		t.Fatalf("queued task after restart: %+v", task)
+	if task := dev.poll(t); task != nil {
+		t.Fatalf("a waiting task survived the restart: %+v", task)
 	}
-	for _, p := range []string{s.cfg.DBPath, s.cfg.DBPath + "-wal"} {
-		b, _ := os.ReadFile(p)
-		for _, plain := range []string{"kiwi-canary", dev.DeviceToken, "/hooks/response/tok"} {
-			if bytes.Contains(b, []byte(plain)) {
-				t.Errorf("%s holds %q in plain text", filepath.Base(p), plain)
-			}
-		}
+	if code := dev.resultWith(t, dev.key, taken.ID, "lost", nil); code != http.StatusNotFound {
+		t.Fatalf("result without its Reply after a restart: HTTP %d, want 404", code)
+	}
+	if code := dev.result(t, dev.key, taken.ID, "done after restart"); code != http.StatusOK {
+		t.Fatalf("result after restart: HTTP %d", code)
+	}
+	if p := ft.next(t); p.text != "done after restart" || p.path != "/hooks/response/tok" {
+		t.Fatalf("posted %+v", p)
+	}
+	if code := dev.result(t, dev.key, taken.ID, "again"); code != http.StatusNotFound {
+		t.Fatalf("second result: HTTP %d, want 404", code)
+	}
+	other := register(t, hs.URL, "")
+	other.replies[taken.ID] = dev.replies[taken.ID]
+	if code := other.result(t, other.key, taken.ID, "stolen"); code != http.StatusNotFound {
+		t.Fatalf("another device replaying the Reply: HTTP %d, want 404", code)
 	}
 }
 
@@ -375,6 +406,7 @@ func TestAllowedUsers(t *testing.T) {
 
 func TestExpiryAndWebhookFallback(t *testing.T) {
 	s, base, ft := newTestServer(t, func(c *Config) {
+		c.LeaseSec = 1
 		c.Bots[0].RoomWebhooks = map[string]string{"R1": strings.TrimSuffix(c.ResponseURLPrefix, "/hooks/response/") + "/hooks/webhook"}
 	})
 
@@ -402,6 +434,7 @@ func TestExpiryAndWebhookFallback(t *testing.T) {
 	if !leased || !queued {
 		t.Fatalf("expiry replies: %+v", got)
 	}
+	time.Sleep(s.cfg.lease() + 100*time.Millisecond) // past the lease in the task's Reply too
 	if code := dev.result(t, dev.key, task.ID, "late"); code != http.StatusNotFound {
 		t.Fatalf("late result: HTTP %d, want 404", code)
 	}

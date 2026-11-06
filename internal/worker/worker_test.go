@@ -26,10 +26,15 @@ import (
 // TestMain lets the test binary stand in for sdk/runner.mjs: with AGENTLINK_STUB_RUNNER
 // set it logs the request there, echoes the prompt and cwd, and reports the session id it
 // was given. The prompt "sleep" makes it hang; "wait" holds it until the file named by
-// AGENTLINK_STUB_GATE exists.
+// AGENTLINK_STUB_GATE exists. While the file named by AGENTLINK_STUB_LIMIT exists, it
+// reports the usage limit that file holds instead.
 func TestMain(m *testing.M) {
 	if logPath := os.Getenv("AGENTLINK_STUB_MIRASIM"); logPath != "" && len(os.Args) > 1 && os.Args[1] == "ui-cli" {
 		stubMirasim(logPath, os.Args[1:])
+		return
+	}
+	if logPath := os.Getenv("AGENTLINK_STUB_KIMI"); logPath != "" && len(os.Args) > 1 && (os.Args[1] == "web" || slices.Contains(os.Args, "--output-format")) {
+		stubKimi(logPath, os.Args[1:])
 		return
 	}
 	if logPath := os.Getenv("AGENTLINK_STUB_RUNNER"); logPath != "" {
@@ -46,6 +51,12 @@ func TestMain(m *testing.M) {
 				break
 			}
 			time.Sleep(20 * time.Millisecond)
+		}
+		if b, err := os.ReadFile(os.Getenv("AGENTLINK_STUB_LIMIT")); err == nil {
+			out := runReply{Type: "result", Text: "You've hit your limit", SessionID: req.SessionID, IsError: true}
+			json.Unmarshal(b, &out.RateLimit)
+			json.NewEncoder(os.Stdout).Encode(out)
+			return
 		}
 		cwd, _ := os.Getwd()
 		json.NewEncoder(os.Stdout).Encode(runReply{Type: "result", Text: "echo: " + req.Prompt + " @ " + cwd, SessionID: req.SessionID, NumTurns: 1, TotalCostUSD: 0.01})
@@ -258,6 +269,9 @@ func TestSessionsRunSideBySide(t *testing.T) {
 		json.NewDecoder(r.Body).Decode(&env)
 		mu.Lock()
 		order = append(order, env.ID)
+		if string(env.Reply) != "box-"+env.ID {
+			order = append(order, "result without its task's Reply")
+		}
 		mu.Unlock()
 	}))
 	defer hs.Close()
@@ -271,7 +285,9 @@ func TestSessionsRunSideBySide(t *testing.T) {
 	}
 	w.setIdentity(Identity{DeviceID: "d", DeviceKey: seal.NewPrivateKey().Bytes(), ServerKey: seal.NewPrivateKey().PublicKey().Bytes()})
 	ctx := context.Background()
-	task := func(id, text string) proto.Task { return proto.Task{ID: id, RoomID: "R1", UserID: "U1", Text: text} }
+	task := func(id, text string) proto.Task {
+		return proto.Task{ID: id, RoomID: "R1", UserID: "U1", Text: text, Reply: []byte("box-" + id)}
+	}
 	w.handle(ctx, task("t0", "first"))
 	other := f.last(t).SessionID
 	w.handle(ctx, task("t1", "new second"))

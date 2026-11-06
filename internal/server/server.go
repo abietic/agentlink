@@ -3,10 +3,13 @@
 // can also be triggered without a mention, by a worker (POST /api/v1/trigger) or by a
 // Sentry integration (POST /sentry/{bot}); their results go to the room's webhook.
 //
-// State lives in SQLite. A task's content is sealed to its device's key as soon as it
-// arrives, so the database and everything between server and worker (the TLS-terminating
-// proxy included) only see ciphertext; response_urls are encrypted with the server's
-// storage key. Logs carry ids, never message text.
+// Messages are only passed through: a task waits in memory until its device takes it, sealed
+// to that device's key, so nothing between server and worker (the TLS-terminating proxy
+// included) sees its content. Where the result goes travels with the task, boxed with the
+// server's storage key, and comes back with the result; once a device has a task, the server
+// keeps only what it needs to say the task was dropped, and a restart loses nothing but tasks
+// still waiting. SQLite holds only devices, room bindings and the server's key. Logs carry
+// ids, never message text.
 package server
 
 import (
@@ -65,19 +68,9 @@ CREATE TABLE IF NOT EXISTS bindings (
 	bound_at INTEGER NOT NULL,
 	PRIMARY KEY (bot, room_id)
 );
-CREATE TABLE IF NOT EXISTS tasks (
-	seq INTEGER PRIMARY KEY AUTOINCREMENT,
-	id TEXT NOT NULL UNIQUE,
-	device_id TEXT NOT NULL,
-	bot TEXT NOT NULL,
-	room_id TEXT NOT NULL,
-	payload BLOB NOT NULL,  -- proto.Task sealed to the device
-	reply_to BLOB NOT NULL, -- response_url boxed with the storage key
-	created_at INTEGER NOT NULL,
-	leased_until INTEGER NOT NULL DEFAULT 0 -- 0 = waiting
-);
-CREATE INDEX IF NOT EXISTS tasks_by_device ON tasks (device_id, seq);
-CREATE TABLE IF NOT EXISTS events (id TEXT PRIMARY KEY, seen_at INTEGER NOT NULL);
+-- Tasks and seen event ids were kept here before 0.4; they live in memory now.
+DROP TABLE IF EXISTS tasks;
+DROP TABLE IF EXISTS events;
 `
 
 const helpText = `**agentlink** runs what you write on the device paired with this room, through its harness (the Claude Agent SDK, or mirasim).
@@ -107,8 +100,30 @@ type Server struct {
 	http *http.Client
 	now  func() time.Time
 
-	mu   sync.Mutex
-	wake map[string]chan struct{} // device → long-poll wakeup
+	mu      sync.Mutex
+	wake    map[string]chan struct{} // device → long-poll wakeup
+	waiting map[string][]*task       // device → tasks it has not taken yet, oldest first
+	leased  map[string]*task         // task id → a task a device has taken (without its content)
+	seen    map[string]time.Time     // dedupe key → when to forget it
+}
+
+// task is a queued or taken task. Its content leaves the server with the device.
+type task struct {
+	id, dev, bot, room string
+	sealed             []byte // proto.Task sealed to the device; nil once taken
+	reply              string // response_url; empty for triggered tasks
+	created            time.Time
+	until              time.Time // lease end; zero while waiting
+}
+
+// replyTo is where a taken task's result goes. It travels with the task, boxed with the
+// storage key, so a result can be posted after a restart.
+type replyTo struct {
+	Dev   string `json:"dev"`
+	Bot   string `json:"bot"`
+	Room  string `json:"room"`
+	URL   string `json:"url"`
+	Until int64  `json:"until"` // lease end, unix ms: a later result is refused
 }
 
 func New(cfg Config) (*Server, error) {
@@ -123,14 +138,20 @@ func New(cfg Config) (*Server, error) {
 	if err != nil {
 		return nil, err
 	}
+	if _, err := db.Exec(`VACUUM`); err != nil { // rewrites the file, so dropped task rows leave no trace in it
+		log.Printf("vacuum: %v", err)
+	}
 	s := &Server{
-		cfg:  cfg,
-		bots: map[string]*Bot{},
-		db:   db,
-		key:  key,
-		http: &http.Client{Timeout: 15 * time.Second},
-		now:  time.Now,
-		wake: map[string]chan struct{}{},
+		cfg:     cfg,
+		bots:    map[string]*Bot{},
+		db:      db,
+		key:     key,
+		http:    &http.Client{Timeout: 15 * time.Second},
+		now:     time.Now,
+		wake:    map[string]chan struct{}{},
+		waiting: map[string][]*task{},
+		leased:  map[string]*task{},
+		seen:    map[string]time.Time{},
 	}
 	for i := range s.cfg.Bots {
 		s.bots[s.cfg.Bots[i].Name] = &s.cfg.Bots[i]
@@ -236,16 +257,8 @@ func (s *Server) handleEvent(w http.ResponseWriter, r *http.Request) {
 		_ = json.Unmarshal(body, &raw)
 		log.Printf("bot %s: event %s shape %q", bot.Name, env.EventID, shape(raw))
 	}
-	if env.Type == "event_callback" && env.Event != nil && env.Event.Type == "app_mention" {
-		first, err := s.firstSeen(bot.Name + "/" + env.EventID)
-		if err != nil {
-			log.Printf("bot %s: dedupe: %v", bot.Name, err)
-			http.Error(w, "storage error", http.StatusInternalServerError) // Tanka retries
-			return
-		}
-		if first {
-			s.onMention(bot, *env.Event)
-		}
+	if env.Type == "event_callback" && env.Event != nil && env.Event.Type == "app_mention" && s.firstSeen(bot.Name+"/"+env.EventID, dedupeTTL) {
+		s.onMention(bot, *env.Event)
 	}
 	writeJSON(w, http.StatusOK, map[string]int{"code": 0})
 }
@@ -277,19 +290,24 @@ func shape(v any) string {
 	return "?"
 }
 
-func (s *Server) firstSeen(key string) (bool, error) {
+// firstSeen reports whether key is new, and remembers it for ttl. A restart forgets every
+// key; Tanka only retries a delivery that was not answered, so that rarely matters.
+func (s *Server) firstSeen(key string, ttl time.Duration) bool {
 	if strings.HasSuffix(key, "/") { // no event_id
-		return true, nil
+		return true
 	}
-	res, err := s.db.Exec(`INSERT INTO events (id, seen_at) VALUES (?, ?) ON CONFLICT (id) DO NOTHING`, key, s.now().UnixMilli())
-	if err != nil {
-		return false, err
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if _, ok := s.seen[key]; ok {
+		return false
 	}
-	n, err := res.RowsAffected()
-	return n == 1, err
+	s.seen[key] = s.now().Add(ttl)
+	return true
 }
 
 func (s *Server) onMention(bot *Bot, ev tanka.MentionEvent) {
+	// sender_type is not in Tanka's docs; its value (not message content) says whether bots' mentions arrive.
+	log.Printf("bot %s: mention room=%s user=%s sender_type=%q", bot.Name, ev.RoomID, ev.UserID, ev.SenderType)
 	if len(s.cfg.AllowedUsers) > 0 && !slices.Contains(s.cfg.AllowedUsers, ev.UserID) {
 		log.Printf("bot %s room=%s user=%s: not in allowed_users", bot.Name, ev.RoomID, ev.UserID)
 		s.replyAsync(bot, ev.RoomID, ev.ResponseURL, fmt.Sprintf("User `%s` is not allowed to use this bot.", ev.UserID))
@@ -375,10 +393,6 @@ func (s *Server) unpair(bot *Bot, roomID string) string {
 
 func (s *Server) enqueue(bot *Bot, ev tanka.MentionEvent, text string) {
 	d, err := s.deviceWhere(`id = (SELECT device_id FROM bindings WHERE bot = ? AND room_id = ?)`, bot.Name, ev.RoomID)
-	var queued int
-	if err == nil {
-		err = s.db.QueryRow(`SELECT count(*) FROM tasks WHERE device_id = ?`, d.ID).Scan(&queued)
-	}
 	var msg string
 	switch {
 	case errors.Is(err, sql.ErrNoRows):
@@ -389,25 +403,30 @@ func (s *Server) enqueue(bot *Bot, ev tanka.MentionEvent, text string) {
 	case !s.online(d):
 		// Not queued: a prompt that runs hours later, when the laptop wakes up, would surprise.
 		msg = fmt.Sprintf("Device `%s` is offline (last seen %s), so nothing was queued.", d.ID, s.ago(d.LastSeen))
-	case queued >= maxQueuePerDev:
-		msg = fmt.Sprintf("Device `%s` already has %d tasks waiting; try again later.", d.ID, maxQueuePerDev)
 	default:
 		t := proto.Task{RoomID: ev.RoomID, RoomName: ev.RoomName, UserID: ev.UserID, UserName: ev.UserName, Text: text}
 		for _, a := range ev.Attachments {
 			t.Attachments = append(t.Attachments, proto.Attachment{URL: a.URL, Name: a.Name})
 		}
 		id, err := s.insertTask(bot, d, t, ev.ResponseURL)
-		if err == nil {
+		switch {
+		case err == nil:
 			log.Printf("task %s queued bot=%s room=%s user=%s device=%s attachments=%d", id, bot.Name, ev.RoomID, ev.UserID, d.ID, len(t.Attachments))
 			return
+		case errors.Is(err, errQueueFull):
+			msg = fmt.Sprintf("Device `%s` already has %d tasks waiting; try again later.", d.ID, maxQueuePerDev)
+		default:
+			log.Printf("enqueue: %v", err)
+			msg = "The server could not queue the task, so nothing was queued."
 		}
-		log.Printf("enqueue: %v", err)
-		msg = "The server could not store the task, so nothing was queued."
 	}
 	s.replyAsync(bot, ev.RoomID, ev.ResponseURL, msg)
 }
 
-// insertTask fills in t's id and time, seals it to d and queues it; responseURL may be empty.
+var errQueueFull = fmt.Errorf("already has %d tasks waiting or running", maxQueuePerDev)
+
+// insertTask fills in t's id and time, seals it to d and queues it in memory; responseURL
+// may be empty. It refuses once d has maxQueuePerDev tasks waiting or running.
 func (s *Server) insertTask(bot *Bot, d *device, t proto.Task, responseURL string) (string, error) {
 	id := "t-" + randHex(6)
 	t.ID, t.CreatedAt = id, s.now()
@@ -415,19 +434,23 @@ func (s *Server) insertTask(bot *Bot, d *device, t proto.Task, responseURL strin
 	if err != nil {
 		return "", err
 	}
-	payload, err := seal.Seal(s.priv, d.Pub, proto.TaskContext(d.ID, id), plain)
+	sealed, err := seal.Seal(s.priv, d.Pub, proto.TaskContext(d.ID, id), plain)
 	if err != nil {
 		return "", err
 	}
-	replyTo, err := seal.Box(s.key, "reply "+id, []byte(responseURL))
-	if err != nil {
-		return "", err
+	s.mu.Lock()
+	n := len(s.waiting[d.ID])
+	for _, l := range s.leased {
+		if l.dev == d.ID {
+			n++
+		}
 	}
-	_, err = s.db.Exec(`INSERT INTO tasks (id, device_id, bot, room_id, payload, reply_to, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)`,
-		id, d.ID, bot.Name, t.RoomID, payload, replyTo, s.now().UnixMilli())
-	if err != nil {
-		return "", err
+	if n >= maxQueuePerDev {
+		s.mu.Unlock()
+		return "", errQueueFull
 	}
+	s.waiting[d.ID] = append(s.waiting[d.ID], &task{id: id, dev: d.ID, bot: bot.Name, room: t.RoomID, sealed: sealed, reply: responseURL, created: s.now()})
+	s.mu.Unlock()
 	s.signal(d.ID)
 	return id, nil
 }
@@ -442,14 +465,11 @@ func (s *Server) trigger(bot *Bot, roomID, name, key, text string) (string, erro
 	if err != nil {
 		return "", err
 	}
-	var queued int
-	if err := s.db.QueryRow(`SELECT count(*) FROM tasks WHERE device_id = ?`, d.ID).Scan(&queued); err != nil {
-		return "", err
+	id, err := s.insertTask(bot, d, proto.Task{RoomID: roomID, Text: text, Trigger: name, Key: key}, "")
+	if err != nil {
+		return "", fmt.Errorf("device %s: %w", d.ID, err)
 	}
-	if queued >= maxQueuePerDev {
-		return "", fmt.Errorf("device %s already has %d tasks waiting", d.ID, queued)
-	}
-	return s.insertTask(bot, d, proto.Task{RoomID: roomID, Text: text, Trigger: name, Key: key}, "")
+	return id, nil
 }
 
 // handleTrigger queues a task a worker's trigger produced. The body is sealed by the
@@ -590,17 +610,55 @@ func (s *Server) touch(dev string) {
 	}
 }
 
-// lease hands the device's oldest waiting task to it, in one statement so two polls
-// cannot both take it.
+// lease hands the device its oldest waiting task, with where the result goes boxed in Reply,
+// and forgets the task's content.
 func (s *Server) lease(dev string) (*proto.Envelope, error) {
-	var env proto.Envelope
-	err := s.db.QueryRow(`UPDATE tasks SET leased_until = ?
-		WHERE seq = (SELECT seq FROM tasks WHERE device_id = ? AND leased_until = 0 ORDER BY seq LIMIT 1)
-		RETURNING id, payload`, s.now().Add(s.cfg.lease()).UnixMilli(), dev).Scan(&env.ID, &env.Sealed)
-	if errors.Is(err, sql.ErrNoRows) {
+	s.mu.Lock()
+	q := s.waiting[dev]
+	if len(q) == 0 {
+		s.mu.Unlock()
 		return nil, nil
 	}
-	return &env, err
+	t := q[0]
+	if s.waiting[dev] = q[1:]; len(q) == 1 {
+		delete(s.waiting, dev)
+	}
+	sealed := t.sealed
+	t.sealed, t.until = nil, s.now().Add(s.cfg.lease())
+	s.leased[t.id] = t
+	s.mu.Unlock()
+	plain, _ := json.Marshal(replyTo{Dev: t.dev, Bot: t.bot, Room: t.room, URL: t.reply, Until: t.until.UnixMilli()})
+	boxed, err := seal.Box(s.key, "reply "+t.id, plain)
+	if err != nil {
+		return nil, err
+	}
+	return &proto.Envelope{ID: t.id, Sealed: sealed, Reply: boxed}, nil
+}
+
+// taken returns where the result of task id, taken by dev, goes: from memory, or after a
+// restart from the box the device sent back. It returns nil for a task that was never taken,
+// was already answered, or whose lease ended.
+func (s *Server) taken(dev, id string, boxed []byte) *replyTo {
+	s.mu.Lock()
+	t := s.leased[id]
+	if t != nil && (t.dev != dev || s.now().After(t.until)) {
+		t = nil // a lapsed lease is left for reapExpired, which tells the room
+	}
+	if t != nil {
+		delete(s.leased, id)
+	}
+	s.mu.Unlock()
+	var rt replyTo
+	if t != nil {
+		rt = replyTo{Dev: t.dev, Bot: t.bot, Room: t.room, URL: t.reply, Until: t.until.UnixMilli()}
+	} else if plain, err := seal.Unbox(s.key, "reply "+id, boxed); err != nil || json.Unmarshal(plain, &rt) != nil || rt.Dev != dev {
+		return nil
+	}
+	until := time.UnixMilli(rt.Until)
+	if s.now().After(until) || !s.firstSeen("result/"+id, until.Sub(s.now())) {
+		return nil
+	}
+	return &rt
 }
 
 func (s *Server) handleResult(w http.ResponseWriter, r *http.Request) {
@@ -625,82 +683,65 @@ func (s *Server) handleResult(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "result does not decrypt for this device and task", http.StatusBadRequest)
 		return
 	}
-	var botName, room string
-	var replyTo []byte
-	err = s.db.QueryRow(`DELETE FROM tasks WHERE id = ? AND device_id = ? AND leased_until > 0 RETURNING bot, room_id, reply_to`,
-		id, d.ID).Scan(&botName, &room, &replyTo)
-	if errors.Is(err, sql.ErrNoRows) {
+	rt := s.taken(d.ID, id, env.Reply)
+	if rt == nil {
 		http.Error(w, "unknown task", http.StatusNotFound)
 		return
 	}
-	if err != nil {
-		log.Printf("task %s: %v", id, err)
-		http.Error(w, "storage error", http.StatusInternalServerError)
-		return
-	}
 	if res.Text == "" {
-		log.Printf("task %s done room=%s (nothing to post)", id, room)
+		log.Printf("task %s done room=%s (nothing to post)", id, rt.Room)
 		writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
 		return
 	}
-	if err := s.reply(s.bots[botName], room, s.responseURL(id, replyTo), res.Text); err != nil {
+	if err := s.reply(s.bots[rt.Bot], rt.Room, rt.URL, res.Text); err != nil {
 		log.Printf("task %s: reply failed: %v", id, err)
 		http.Error(w, "reply failed", http.StatusBadGateway)
 		return
 	}
-	log.Printf("task %s done room=%s", id, room)
+	log.Printf("task %s done room=%s", id, rt.Room)
 	writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
 }
 
 func (s *Server) reapExpired(now time.Time) {
-	rows, err := s.db.Query(`DELETE FROM tasks
-		WHERE (leased_until > 0 AND leased_until < ?) OR (leased_until = 0 AND created_at < ?)
-		RETURNING id, device_id, bot, room_id, reply_to, leased_until`,
-		now.UnixMilli(), now.Add(-s.cfg.queueTTL()).UnixMilli())
-	if err != nil {
-		log.Printf("reap: %v", err)
-		return
-	}
-	type dropped struct {
-		id, dev, bot, room string
-		replyTo            []byte
-		leased             int64
-	}
-	var all []dropped
-	for rows.Next() {
-		var d dropped
-		if err := rows.Scan(&d.id, &d.dev, &d.bot, &d.room, &d.replyTo, &d.leased); err != nil {
-			log.Printf("reap: %v", err)
-			continue
-		}
-		all = append(all, d)
-	}
-	rows.Close()
-	for _, d := range all {
-		msg := fmt.Sprintf("Device `%s` did not pick this task up within %s, so it was dropped.", d.dev, s.cfg.queueTTL())
-		if d.leased > 0 {
-			msg = fmt.Sprintf("Device `%s` took this task but sent no result within %s, so it was dropped.", d.dev, s.cfg.lease())
-		}
-		log.Printf("task %s expired on device %s", d.id, d.dev)
-		// Only a mention gets told: a triggered task has no response_url, and an asleep
-		// laptop would otherwise fill the room with notices.
-		if u := s.responseURL(d.id, d.replyTo); u != "" {
-			if bot := s.bots[d.bot]; bot != nil {
-				s.replyAsync(bot, d.room, u, msg)
+	var dropped []*task
+	s.mu.Lock()
+	for dev, q := range s.waiting {
+		keep := q[:0]
+		for _, t := range q {
+			if t.created.Before(now.Add(-s.cfg.queueTTL())) {
+				dropped = append(dropped, t)
+			} else {
+				keep = append(keep, t)
 			}
 		}
+		if s.waiting[dev] = keep; len(keep) == 0 {
+			delete(s.waiting, dev)
+		}
 	}
-	if _, err := s.db.Exec(`DELETE FROM events WHERE seen_at < ?`, now.Add(-dedupeTTL).UnixMilli()); err != nil {
-		log.Printf("reap events: %v", err)
+	for id, t := range s.leased {
+		if t.until.Before(now) {
+			dropped = append(dropped, t)
+			delete(s.leased, id)
+		}
 	}
-}
-
-func (s *Server) responseURL(taskID string, boxed []byte) string {
-	u, err := seal.Unbox(s.key, "reply "+taskID, boxed)
-	if err != nil {
-		log.Printf("task %s: response_url: %v", taskID, err)
+	for k, until := range s.seen {
+		if until.Before(now) {
+			delete(s.seen, k)
+		}
 	}
-	return string(u)
+	s.mu.Unlock()
+	for _, t := range dropped {
+		msg := fmt.Sprintf("Device `%s` did not pick this task up within %s, so it was dropped.", t.dev, s.cfg.queueTTL())
+		if !t.until.IsZero() {
+			msg = fmt.Sprintf("Device `%s` took this task but sent no result within %s, so it was dropped.", t.dev, s.cfg.lease())
+		}
+		log.Printf("task %s expired on device %s", t.id, t.dev)
+		// Only a mention gets told: a triggered task has no response_url, and an asleep
+		// laptop would otherwise fill the room with notices.
+		if bot := s.bots[t.bot]; bot != nil && t.reply != "" {
+			s.replyAsync(bot, t.room, t.reply, msg)
+		}
+	}
 }
 
 func (s *Server) replyAsync(bot *Bot, roomID, responseURL, text string) {

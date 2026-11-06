@@ -1,6 +1,6 @@
 # agentlink
 
-在 Tanka 群里 @ 机器人，消息就交给一台配对好的机器，由那台机器上的 harness（Claude Agent SDK，或 mirasim）执行，结果回帖到同一个群（挂在原消息下面）。服务端只负责收发和路由；源码、凭证和执行都留在 worker 所在的机器上。
+在 Tanka 群里 @ 机器人，消息就交给一台配对好的机器，由那台机器上的 harness（Claude Agent SDK、mirasim 或 Kimi Code）执行，结果回帖到同一个群（挂在原消息下面）。服务端只负责收发和路由；源码、凭证和执行都留在 worker 所在的机器上。
 
 ```
 Tanka 群 ──@bot──▶ agentlink-server ◀──长轮询── agentlink-worker ──▶ node sdk/runner.mjs ──▶ Agent SDK query()
@@ -8,7 +8,7 @@ Tanka 群 ──@bot──▶ agentlink-server ◀──长轮询── agentlin
    └──────── response_url / 群 webhook ◀───────────┘
 ```
 
-- **server**：校验 Tanka 签名，按 `(bot, room_id)` 找到配对的设备，把任务加密后放进该设备的队列（SQLite）；worker 交回结果后，用事件里的 `response_url` 回帖，失败再用该群的 incoming webhook。
+- **server**：校验 Tanka 签名，按 `(bot, room_id)` 找到配对的设备，把任务加密后放进该设备在内存里的队列；worker 取走时，任务就从 server 上删掉，回帖去向（`response_url` 等）用 server 的存储密钥封好随任务交给 worker，worker 交回结果时带回来，server 据此回帖，失败再用该群的 incoming webhook。消息不落盘：SQLite 里只有设备、配对和 server 的密钥。
 - **worker**：凭 device id / token 与 server 配对，只发出站请求（不需要公网入口）。每个群在本机有自己的工作目录和当前会话：默认续接当前会话，也可以新建、切回旧会话或换目录。
 - **执行走官方 Agent SDK**：Go 没有官方 SDK，worker 每条 prompt 起一个 `node sdk/runner.mjs`，由它调用 `@anthropic-ai/claude-agent-sdk` 的 `query()`。新会话用 `options.sessionId`（worker 自己生成的 UUID），续接用 `options.resume`，会话 id 不变；SIGTERM 会 abort 这次 query，已做的部分留在会话里。`sdk_options` 原样传给 `query()`。
 
@@ -21,12 +21,30 @@ Tanka 群 ──@bot──▶ agentlink-server ◀──长轮询── agentlin
 
 ## Harness（用什么执行）
 
-worker 配置里的 `harnesses` 列出这台设备能用的执行方式，`harness` 是默认的那个；群里发 `harness <名字>` 切换本群的，切换后下一条 prompt 新开会话。每个会话记着自己是哪个 harness 跑的，用会话 id 续接时还走原来的那个。
+worker 配置里的 `harnesses` 列出这台设备能用的执行方式，`harness` 是默认的那个；群里发 `harness <名字>` 切换本群的，切换后下一条 prompt 新开会话。每个会话记着自己是哪个 harness 跑的，续接时（当前会话或用会话 id）都走原来的那个；设备默认 harness 改了，已有会话也照旧，`new` 才用新的。
 
 | `type` | 怎么执行 | 配置 |
 |---|---|---|
 | `sdk`（默认） | `node sdk/runner.mjs` 调 Agent SDK 的 `query()`，见上面 | `runner`、`sdk_options`，不填就用顶层的；顶层配了 `runner` 就自动有一个叫 `claude` 的 |
 | `mirasim` | `mirasim ui-cli prompt` 交给正在运行的 mirasim（默认桌面版，端口 4970），会话出现在 mirasim 的侧栏和手机端 | `command`（默认 `["mirasim"]`）、`port`、`agent`（默认 `claude`）、`model`、`effort`、`route`、`members` |
+| `kimi` | Kimi Code CLI 的非交互模式 `kimi -p <prompt> --output-format stream-json`，续接用 `-S` | `command`（默认 `["kimi"]`）、`model`（不填用 kimi 自己的默认） |
+
+每个 harness 都可以配 `fallback`（harness 名字的列表，按顺序）：它在用量上限里、或者根本起不来（没有返回会话）时，prompt 交给列表里下一个能用的。回退出来的是新会话，因为一个 harness 续接不了另一个的会话；这个新会话成为本群的当前会话，之后在它自己的 harness 上续接，`new` 才回到本群的 harness。
+
+### 用量上限
+
+- **Claude（`sdk`）**：runner 从 Agent SDK 的消息流里读 `rate_limit_event`（`status: rejected` 时带 `rateLimitType`：`five_hour`、`seven_day`、`seven_day_opus`、`seven_day_sonnet`、`overage` 等，和 `resetsAt`）；重试用完后 SDK 发出 `error: rate_limit` 的 assistant 消息，runner 就把这个上限交给 worker。
+- **Kimi（`kimi`）**：额度只能从 kimi 的本地服务查。一轮失败时，worker 临时起一个 `kimi web --no-open`，用它启动时打印的令牌请求 `GET /api/v1/oauth/usage`（令牌不写日志、不外传），查完就停掉。`limit5h`、`limit7d`、`monthCode`、`monthTotal` 里有用满的（`usedRatio ≥ 1`），就按其中最晚重置的那个记上限。额度耗尽的 429 kimi 不重试，立即失败。
+- worker 按 harness 记「在哪个上限里、到什么时候」，加密存在本地，重启不丢。到点之前这个 harness 不再跑，直接交给 `fallback`；没说重置时间的上限按 30 分钟后再试。
+- 只有**第一次**撞上时回帖说明：哪个 harness、哪个上限、几点重置（本机时区）。之后同一轮上限里，有回退就安静地交给回退（页脚显示 harness 名）；续接中的会话被回退接走时，回帖注明新会话没有原会话的上下文。没有可用 harness 时，触发任务什么都不发（只记日志），有人 @ 时回一行「都在上限里，几点恢复」。这个 harness 之后有一轮正常跑完，才算出了这轮上限；`status` 列出还在上限里的 harness。
+
+Kimi 的几点限制：
+
+- prompt 在命令行参数里（`-p` 不读 stdin），本机其他用户用 `ps` 能看到。
+- `-p` 模式不问人：工具调用按 kimi 的 `auto` 权限策略执行，配置里的静态拒绝规则照样生效。
+- 图片写进临时目录，用 `--add-dir` 交给 kimi，并在 prompt 里列出路径让它用 `ReadMediaFile` 读；这轮结束就删。能不能看图取决于所用模型。
+- worker 设了 `KIMI_DISABLE_TELEMETRY=1`。prompt、代码和群里的图片会发给 Moonshot（Kimi 的服务方）；用它做 `fallback` 前，先确认这些数据可以给它。
+- 新会话的 id 由 kimi 分配，worker 记的是 `session_` 后面那段。回帖页脚的轮数是工具调用的次数，没有费用。
 
 mirasim 的几点限制：
 
@@ -42,14 +60,14 @@ mirasim 的几点限制：
   没映射的人和触发式任务仍以机器所有者身份运行。映射到的人如果不是这个空间的成员，mirasim 会悄悄按所有者执行，所以 worker 会先核对成员名单，并在回帖里说明。配了 `members` 后，worker 把每个会话都设成「与成员共享」，因为 mirasim 默认只允许会话创建者在会话里发消息。
 - ui-cli 不读 stdin，prompt 在命令行参数里，本机其他用户用 `ps` 能看到；以 `/` 开头的文字可能被当成 mirasim 的宿主命令（如 `/branch`）。
 - 回帖页脚没有轮数和费用。
-- 触发式任务用设备的默认 harness。
+- 触发式任务用设备的默认 harness（在上限里时按它的 `fallback`）。
 
 给 mirasim 单独配一个机器人：在 Tanka 建第二个应用，server 的 `bots` 里加一项（事件地址 `/tanka/events/<name>`）；本机再跑一个 worker，配置见 `examples/worker-mirasim.json`，launchd 见 `examples/com.agentlink.worker.mirasim.plist`。自动更新会等所有 worker 都空闲，再一起重启（`com.agentlink.worker` 和 `com.agentlink.worker.*`）。
 
 ## 加密
 
 - **端到端（server ⇄ worker）**：设备注册时生成 X25519 密钥对并上报公钥，同时记下 server 的公钥。任务在 server 收到的那一刻就用「临时密钥 + 双方长期密钥」派生的 AES-256-GCM 密钥加密给该设备，结果同样加密给 server；附加数据绑定 `task|result <device-id> <task-id>`，所以一个设备的任务不能被另一个设备解开，结果也不能被冒充或挪到别的任务上。中间的 TLS 终止代理（如 Cloudflare）和 server 的数据库都只看到密文。
-- **落盘**：两边都用 SQLite（`modernc.org/sqlite`，纯 Go）。server 的 `response_url` 和自己的私钥用本地存储密钥（`key_path`，首次启动生成，0600）加密；任务内容本来就是只有设备能解的密文。worker 的身份、令牌、私钥、各群状态和会话标题整体加密存在 `~/.agentlink/worker.db`，密钥在 `~/.agentlink/worker.key`。
+- **落盘**：两边都用 SQLite（`modernc.org/sqlite`，纯 Go）。server 只存设备、配对和自己的私钥（用本地存储密钥 `key_path` 加密，首次启动生成，0600），任务和事件 id 都只在内存里；从 0.4 起启动时删掉旧版留下的任务表并 `VACUUM`。随任务交给 worker 的回帖去向也用这把存储密钥封装，worker 解不开也改不了。worker 的身份、令牌、私钥、各群状态和会话标题整体加密存在 `~/.agentlink/worker.db`，密钥在 `~/.agentlink/worker.key`。
 - Tanka → server 这一段只能是明文（server 要读命令），靠 Tanka 签名校验。
 
 ## 群里的用法
@@ -109,7 +127,7 @@ GOOS=linux GOARCH=amd64 CGO_ENABLED=0 go build -o bin/agentlink-server ./cmd/age
 - 配置见 `examples/server.json`；密钥用环境变量给：`AGENTLINK_ENROLL_TOKEN`（自己生成的长随机串，worker 首次注册用）、`AGENTLINK_SIGNING_SECRET_<BOT>`（机器人名大写，`-` 换成 `_`）、`AGENTLINK_SENTRY_SECRET_<BOT>`（Sentry integration 的 client secret）、`AGENTLINK_ROOM_WEBHOOKS_<BOT>`（JSON 对象 `{"群 id": "webhook URL"}`，与配置文件里的 `room_webhooks` 合并；webhook URL 本身就是发消息的凭证，不要写进仓库）。
 - systemd 单元见 `examples/agentlink-server.service`。server 只监听 HTTP（默认 `127.0.0.1:8080`），TLS 由前面的反向代理负责，读超时要大于 `poll_wait_sec`（默认 25 秒）。
 - `/healthz` 是存活探针。日志里只有 id，没有正文。
-- 队列持久化：server 重启后，排队中的任务照样会交给设备；没人取的任务 `queue_ttl_sec`（默认 10 分钟）后丢弃并回帖说明，取走但没交结果的 `lease_sec` 后丢弃。
+- 队列只在内存：server 重启会丢掉还没被设备取走的任务（在线设备通常一秒内就取走）；已取走的任务不受影响，结果带着回帖去向回来，照样回帖。没人取的任务 `queue_ttl_sec`（默认 10 分钟）后丢弃并回帖说明，取走但没交结果的 `lease_sec` 后丢弃，晚到的结果不再回帖。
 
 ### 3. worker（干活的机器）
 
@@ -133,7 +151,7 @@ AGENTLINK_ENROLL_TOKEN=... agentlink-worker
 
 ## 安全模型
 
-- **入口**：每个事件都要通过对应机器人的 HMAC 签名校验（±5 分钟）；配了 `app_id` 的机器人还要求 `api_app_id` 一致；`event_id` 去重（持久化，重启后也不会重复执行）；`response_url` 只接受 `response_url_prefix` 开头的地址。
+- **入口**：每个事件都要通过对应机器人的 HMAC 签名校验（±5 分钟）；配了 `app_id` 的机器人还要求 `api_app_id` 一致；`event_id` 去重（在内存里，server 重启前后各算一次：重启那一刻 Tanka 恰好重投的事件可能执行两次）；同一个结果只回帖一次（同样记在内存里）；`response_url` 只接受 `response_url_prefix` 开头的地址。
 - **谁能驱动机器**：server 的 `allowed_users` 是可选的粗过滤；最终由 worker 本机的 `allowed_users`（人）和 `allowed_bots`（别的机器人）决定，默认拒绝所有人。设备注册需要 enroll token。
 - **机器人之间交接**：`allowed_bots` 里的机器人 @ 本机器人时照常执行，用来让一个 agent 把工作交给另一个。回帖不会 @ 回这个机器人，被拒绝的发送者也不会被 @，所以两个机器人不会因为互相 @ 而反复触发；要交回去，得由 agent 在自己的回复里明确 @ 下一个机器人。注意：截至 2026-11-02，Tanka 不投递机器人或 webhook 发出的 @（群里显示为真 @，但不产生 `app_mention`），这个配置要等 Tanka 放开后才生效。
 - **能做什么**：工作目录限制在 `workdir_roots` 之内（先解析符号链接再判断）。默认 `permissionMode: "auto"`：由模型分类器逐个批准或拒绝工具调用，判断不了的一律拒绝（没人在场回答权限询问），回复里会注明被拒绝的次数。要更严就改成 `"dontAsk"` 并用 `allowedTools` 预先放行，要更松就在 `allowedTools` 里加。群消息是不可信输入，可能被用来做 prompt 注入；分类器能挡住一部分，但不等于沙箱，`allowed_users` 要保持最小。
@@ -143,6 +161,7 @@ AGENTLINK_ENROLL_TOKEN=... agentlink-worker
 ## 开发
 
 ```bash
-go test -race ./...    # 加密、签名、多机器人路由、去重、持久化与重启、过期、会话生命周期、触发任务、端到端（测试二进制充当 SDK runner）
+go test -race ./...    # 加密、签名、多机器人路由、去重、重启不留消息、过期、会话生命周期、触发任务、用量上限与回退、端到端（测试二进制充当 SDK runner、mirasim 和 kimi）
 AGENTLINK_REAL_CLAUDE=1 go test -run TestRealSDK ./internal/worker   # 真 Agent SDK：新建会话 + resume，约 $0.02
+AGENTLINK_REAL_KIMI=1 go test -run TestRealKimi ./internal/worker     # 真 kimi：新建会话 + 续接 + 查额度，用一点 Kimi 额度
 ```

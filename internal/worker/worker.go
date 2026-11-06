@@ -101,6 +101,7 @@ type Worker struct {
 	running   map[string]running    // by task id
 	locks     map[string]*sessionLock
 	marks     map[string]time.Time // trigger dedupe: "seen/<trigger>/<key>" and "ran/<trigger>/<key>"
+	limits    map[string]Limit     // by harness: the usage limit it last hit, until a run on it finishes without one
 }
 
 func New(cfg Config) (*Worker, error) {
@@ -119,6 +120,7 @@ func New(cfg Config) (*Worker, error) {
 		running: map[string]running{},
 		locks:   map[string]*sessionLock{},
 		marks:   map[string]time.Time{},
+		limits:  map[string]Limit{},
 		files:   attachmentClient,
 		fileOK:  tankaFile,
 	}
@@ -129,6 +131,9 @@ func New(cfg Config) (*Worker, error) {
 		return nil, err
 	}
 	if _, err := st.get("marks", &w.marks); err != nil {
+		return nil, err
+	}
+	if _, err := st.get("limits", &w.limits); err != nil {
 		return nil, err
 	}
 	var id Identity
@@ -223,6 +228,7 @@ func (w *Worker) Run(ctx context.Context) error {
 			log.Printf("task %s: does not decrypt for this device (%v); the server will time it out", env.ID, oerr)
 			continue
 		}
+		t.Reply = env.Reply
 		w.dispatch(ctx, t)
 	}
 	w.wg.Wait()
@@ -356,7 +362,7 @@ func (w *Worker) post(t proto.Task, text string) {
 	}
 	for attempt := 1; ; attempt++ {
 		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-		err := w.client.Result(ctx, proto.Envelope{ID: t.ID, Sealed: sealed})
+		err := w.client.Result(ctx, proto.Envelope{ID: t.ID, Sealed: sealed, Reply: t.Reply})
 		cancel()
 		if err == nil {
 			return
@@ -529,29 +535,104 @@ func (w *Worker) prompt(ctx context.Context, t proto.Task, run Run, current bool
 		run.UserID = t.UserID
 	}
 	text := cmp.Or(run.Prompt, "(image)")
-	w.mu.Lock()
 	if current {
+		w.mu.Lock()
 		rs := w.roomLocked(t.RoomID)
 		run.Harness, run.Workdir, run.SessionID, run.Resume = w.harnessLocked(rs), rs.Workdir, rs.SessionID, rs.SessionID != ""
 		if s, ok := sessionByID(rs.Sessions, rs.SessionID); ok && s.harness() != run.Harness {
-			run.Resume = false // the default harness changed under it: one harness cannot resume another's session
+			// The room's harness changed under its session, or a fallback started it: it
+			// continues on the harness that has its history, or anew if that one is gone.
+			if w.runners[s.harness()] != nil {
+				run.Harness = s.harness()
+			} else {
+				run.Resume = false
+			}
 		}
+		w.mu.Unlock()
 	}
-	if !run.Resume {
-		run.SessionID = newUUID()
-	}
-	w.mu.Unlock()
-	runner := w.runners[run.Harness]
-	if runner == nil {
+	if w.runners[run.Harness] == nil {
 		return fmt.Sprintf("This device has no harness `%s` any more; `harness` lists the ones it has.", run.Harness)
 	}
+
+	var notes, resting []string // what to tell the room; harnesses at a limit
+	chain := w.chain(run.Harness)
+	for i, h := range chain {
+		r := run
+		if h != run.Harness {
+			r.Harness, r.Resume = h, false
+		}
+		w.mu.Lock()
+		l, limited := w.limitedLocked(h)
+		w.mu.Unlock()
+		if limited {
+			resting = append(resting, fmt.Sprintf("`%s` is at %s until %s", h, l, l.until()))
+			continue
+		}
+		if !r.Resume {
+			r.SessionID = newUUID()
+		}
+		res, err := w.attempt(ctx, t, r, current, text)
+		if res.Limit != nil && !res.Stopped {
+			if n := w.hitLimit(h, *res.Limit); n != "" {
+				notes = append(notes, n)
+			}
+			w.mu.Lock()
+			l, _ := w.limitedLocked(h)
+			w.mu.Unlock()
+			resting = append(resting, fmt.Sprintf("`%s` is at %s until %s", h, l, l.until()))
+			continue
+		}
+		if err != nil && res.SessionID == "" && !res.Stopped && i < len(chain)-1 {
+			notes = append(notes, fmt.Sprintf("⚠️ `%s` could not run: %v", h, err))
+			continue
+		}
+		if err == nil {
+			w.clearLimit(h)
+		}
+		if h != run.Harness && run.Resume {
+			why := ""
+			if len(notes) == 0 && len(resting) > 0 {
+				why = strings.Join(resting, "; ") + ", so "
+			}
+			notes = append(notes, fmt.Sprintf("%s`%s` took this over in a new session, without session `%s`'s history.", why, h, short(run.SessionID)))
+		}
+		return joinNotes(notes, w.format(ctx, t, r, res, err, skipped))
+	}
+	log.Printf("task %s: not run: %s", t.ID, strings.Join(resting, "; "))
+	if t.Trigger != "" {
+		if len(notes) == 0 {
+			return "" // the room was told when the limit was hit; posts nothing
+		}
+		return joinNotes(notes, fmt.Sprintf("This `%s` task was not run.", t.Trigger))
+	}
+	return joinNotes(notes, "Nothing ran: "+strings.Join(resting, "; ")+".")
+}
+
+// chain is h and then its fallbacks, each once.
+func (w *Worker) chain(h string) []string {
+	out := []string{h}
+	for _, f := range w.cfg.Harnesses[h].Fallback {
+		if !slices.Contains(out, f) {
+			out = append(out, f)
+		}
+	}
+	return out
+}
+
+func joinNotes(notes []string, reply string) string {
+	return strings.Join(append(notes, reply), "\n\n")
+}
+
+// attempt runs run on its harness and records the session it leaves in the room; with
+// current, that session becomes the room's current one.
+func (w *Worker) attempt(ctx context.Context, t proto.Task, run Run, current bool, text string) (RunResult, error) {
 	defer w.lockSession(run.SessionID)()
 	w.mu.Lock()
 	w.running[t.ID] = running{room: t.RoomID, session: run.SessionID, since: w.now(), prompt: text}
 	w.mu.Unlock()
 
 	log.Printf("task %s: running %s in %s, session %s (resume=%v)", t.ID, run.Harness, run.Workdir, short(run.SessionID), run.Resume)
-	res, err := runner.Run(ctx, run)
+	res, err := w.runners[run.Harness].Run(ctx, run)
 
 	w.mu.Lock()
 	delete(w.running, t.ID)
@@ -565,8 +646,8 @@ func (w *Worker) prompt(ctx context.Context, t proto.Task, run Run, current bool
 		w.saveLocked(t.RoomID)
 	}
 	w.mu.Unlock()
-	log.Printf("task %s: finished in %s (error=%v)", t.ID, res.Duration.Round(time.Second), err != nil || res.IsError)
-	return w.format(ctx, t, run, res, err, skipped)
+	log.Printf("task %s: finished in %s (error=%v, limit=%v)", t.ID, res.Duration.Round(time.Second), err != nil || res.IsError, res.Limit != nil)
+	return res, err
 }
 
 func (w *Worker) format(ctx context.Context, t proto.Task, run Run, res RunResult, err error, skipped []string) string {
@@ -670,6 +751,7 @@ func (w *Worker) query(roomID, name string) string {
 	if queued > 0 {
 		fmt.Fprintf(&b, "- **Queued** %d\n", queued)
 	}
+	b.WriteString(w.limitsLocked())
 	return strings.TrimRight(b.String(), "\n")
 }
 

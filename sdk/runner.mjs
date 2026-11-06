@@ -2,7 +2,8 @@
 //
 // stdin:  {"cwd", "prompt", "session_id", "resume", "images", "options"} — options go to query();
 //         images ([{media_type, data (base64)}]) go in the prompt's message, before its text
-// stdout: one JSON line, {"type":"result", ...} or {"type":"error", "error", "session_id"}
+// stdout: one JSON line, {"type":"result", ...} or {"type":"error", "error", "session_id"}; either
+//         carries "rate_limit": {"type", "resets_at"} when the run stopped at a usage limit
 // SIGTERM aborts the query; the session keeps what was done so far.
 import { query } from '@anthropic-ai/claude-agent-sdk';
 
@@ -20,6 +21,8 @@ else options.sessionId = req.session_id; // a new session under the id the worke
 const print = (o) => process.stdout.write(JSON.stringify(o) + '\n');
 let sessionId = req.session_id;
 let result;
+let limitInfo; // the latest rate_limit_event's rate_limit_info
+let rateLimit; // set when the run stopped at a usage limit
 let prompt = req.prompt;
 if (req.images?.length) {
   const content = req.images.map((i) => ({ type: 'image', source: { type: 'base64', media_type: i.media_type, data: i.data } }));
@@ -32,14 +35,21 @@ if (req.images?.length) {
 try {
   for await (const m of query({ prompt, options })) {
     if (m.session_id) sessionId = m.session_id;
+    if (m.type === 'rate_limit_event') limitInfo = m.rate_limit_info;
+    if (m.type === 'assistant' && m.error === 'rate_limit') {
+      // Retries are over by now. The SDK sends the limit as a rate_limit_event first; a
+      // rejected one names it. Otherwise it is an unnamed limit with no known reset.
+      const info = limitInfo?.status === 'rejected' ? limitInfo : undefined;
+      rateLimit = { type: info?.rateLimitType ?? '', resets_at: info?.resetsAt ?? 0 };
+    }
     if (m.type === 'result') result = m;
   }
 } catch (e) {
-  print({ type: 'error', error: abortController.signal.aborted ? 'aborted' : String(e?.message ?? e), session_id: sessionId });
+  print({ type: 'error', error: abortController.signal.aborted ? 'aborted' : String(e?.message ?? e), session_id: sessionId, rate_limit: rateLimit });
   process.exit(1);
 }
 if (!result) {
-  print({ type: 'error', error: 'the SDK returned no result', session_id: sessionId });
+  print({ type: 'error', error: 'the SDK returned no result', session_id: sessionId, rate_limit: rateLimit });
   process.exit(1);
 }
 const ok = result.subtype === 'success';
@@ -51,4 +61,5 @@ print({
   num_turns: result.num_turns,
   total_cost_usd: result.total_cost_usd,
   denials: result.permission_denials?.length ?? 0,
+  rate_limit: rateLimit,
 });

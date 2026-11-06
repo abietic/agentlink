@@ -225,13 +225,16 @@ func TestHarnessSwitch(t *testing.T) {
 	}
 
 	// The device default changes under a room that never picked one: its current session
-	// belongs to the old harness, so the next prompt starts a new one rather than resuming.
+	// continues on the harness that has its history; `new` starts one on the new default.
 	w.state["R2"] = &RoomState{Workdir: f.root, SessionID: claudeSession, Sessions: []Session{{ID: claudeSession, Workdir: f.root}}}
 	w.cfg.Harness = "mirasim"
 	before := len(stubCalls(t, mlog))
-	w.handle(context.Background(), proto.Task{ID: "t", RoomID: "R2", UserID: "U1", Text: "hello"})
-	if args := stubCalls(t, mlog)[before]; slices.Contains(args, "--session") {
-		t.Fatalf("resumed another harness's session: %q", args)
+	if r := w.handle(context.Background(), proto.Task{ID: "t", RoomID: "R2", UserID: "U1", Text: "hello"}); !strings.HasPrefix(r, "echo: hello") ||
+		f.last(t).SessionID != claudeSession || !f.last(t).Resume || len(stubCalls(t, mlog)) != before {
+		t.Fatalf("session left its harness: %q", r)
+	}
+	if r := w.handle(context.Background(), proto.Task{ID: "t", RoomID: "R2", UserID: "U1", Text: "new hello"}); !strings.HasPrefix(r, "mirasim: hello") {
+		t.Fatalf("new session on the new default: %q", r)
 	}
 }
 
@@ -241,6 +244,8 @@ func TestHarnessConfig(t *testing.T) {
 		"unknown default":         {Runner: []string{"node"}, Harness: "mirasim"},
 		"bad type":                {Harnesses: map[string]Harness{"x": {Type: "codex"}}, Harness: "x"},
 		"bad route":               {Harnesses: map[string]Harness{"m": {Type: "mirasim", Route: "cloud"}}, Harness: "m"},
+		"unknown fallback":        {Harnesses: map[string]Harness{"m": {Type: "mirasim", Fallback: []string{"k"}}}, Harness: "m"},
+		"itself as fallback":      {Harnesses: map[string]Harness{"m": {Type: "mirasim", Fallback: []string{"m"}}}, Harness: "m"},
 	} {
 		if err := c.checkHarnesses(); err == nil {
 			t.Errorf("%s: no error", name)
@@ -249,5 +254,9 @@ func TestHarnessConfig(t *testing.T) {
 	c := Config{Harnesses: map[string]Harness{"m": {Type: "mirasim"}}, Harness: "m"}
 	if err := c.checkHarnesses(); err != nil || c.Harnesses["m"].Port != 4970 || c.Harnesses["m"].Route != "own" || len(c.Harnesses) != 1 {
 		t.Fatalf("mirasim only: %v %+v", err, c.Harnesses)
+	}
+	c = Config{Harnesses: map[string]Harness{"m": {Type: "mirasim", Fallback: []string{"k"}}, "k": {Type: "kimi"}}, Harness: "m"}
+	if err := c.checkHarnesses(); err != nil || !slices.Equal(c.Harnesses["k"].Command, []string{"kimi"}) {
+		t.Fatalf("kimi fallback: %v %+v", err, c.Harnesses)
 	}
 }

@@ -71,8 +71,10 @@ type MentionEvent struct {
 	RoomID      string `json:"room_id"`
 	RoomName    string `json:"room_name"`
 	ResponseURL string `json:"response_url"`
-	// Attachments is not in Tanka's docs: one item per file or image sent with the
-	// mention, [] for text only. Each url is a download link that needs no login.
+	// SenderType is not in Tanka's docs; it arrived on 2026-11-05.
+	SenderType string `json:"sender_type"`
+	// Attachments has one item per file or image sent with the mention (or with the batch it
+	// was sent in), [] for text only. Each url is a download link that needs no login.
 	Attachments []Attachment `json:"attachments"`
 }
 
