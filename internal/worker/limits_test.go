@@ -176,6 +176,9 @@ func TestLimitNoticeOnceThenFallback(t *testing.T) {
 	if r := w.query("R1", "status"); !strings.Contains(r, "**At a limit** `claude`: weekly limit (`seven_day`), until "+reset.Local().Format("Mon 01-02 15:04 MST")) {
 		t.Fatalf("status: %q", r)
 	}
+	if st := w.status(); len(st.Limits) != 1 || st.Limits[0] != (proto.HarnessLimit{Harness: "claude", Limit: "seven_day", Until: reset}) || st.Version != proto.Version {
+		t.Fatalf("status for the server: %+v", st)
+	}
 
 	// A restart keeps the limit: a new session in another room goes to kimi, silently.
 	w2, err := New(f.cfg)

@@ -444,6 +444,34 @@ func TestEndToEnd(t *testing.T) {
 		t.Fatal("worker did not stop")
 	}
 
+	// The run log matches the server's task log by task id, without prompts or room ids.
+	// Refusals and status are posted on their own goroutines, which log once the server answers.
+	var runs []byte
+	for deadline := time.Now().Add(5 * time.Second); time.Now().Before(deadline); time.Sleep(20 * time.Millisecond) {
+		if runs, _ = os.ReadFile(filepath.Join(f.cfg.StateDir, "runs.jsonl")); bytes.Count(runs, []byte(`"event":"result"`)) >= 7 {
+			break
+		}
+	}
+	if bytes.Contains(runs, []byte("zebra-canary")) || bytes.Contains(runs, []byte("room-canary-77")) {
+		t.Errorf("runs.jsonl holds a prompt or room id:\n%s", runs)
+	}
+	events := map[string]int{}
+	for line := range bytes.Lines(runs) {
+		var r runRecord
+		if err := json.Unmarshal(line, &r); err != nil || r.Task == "" || r.Error != "" {
+			t.Fatalf("run log line %q: %v", line, err)
+		}
+		events[r.Event]++
+	}
+	// Pairing and early "offline" pings are the server's; the worker answered 7 mentions and ran 4.
+	if events["run"] != 4 || events["result"] != 7 {
+		t.Errorf("run log events: %v\n%s", events, runs)
+	}
+	var stats bytes.Buffer
+	if err := server.Stats(&stats, srvDB, 1, "", time.Now()); err != nil || !strings.Contains(stats.String(), w.DeviceID()) || !strings.Contains(stats.String(), "dev ") {
+		t.Errorf("server stats: %v\n%s", err, stats.String())
+	}
+
 	// Both databases (and their WAL files) only ever held the prompt encrypted, and the
 	// worker's does not reveal which rooms it serves (the server needs room ids to route).
 	for _, p := range []string{srvDB, srvDB + "-wal", filepath.Join(f.cfg.StateDir, "worker.db"), filepath.Join(f.cfg.StateDir, "worker.db-wal")} {

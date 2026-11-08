@@ -31,3 +31,11 @@ func Open(path, schema string) (*sql.DB, error) {
 	}
 	return db, nil
 }
+
+// OpenReadOnly opens an existing database for reading only, alongside a process that writes it.
+func OpenReadOnly(path string) (*sql.DB, error) {
+	if _, err := os.Stat(path); err != nil {
+		return nil, err
+	}
+	return sql.Open("sqlite", "file:"+path+"?mode=ro&_pragma=busy_timeout(5000)&_pragma=query_only(1)")
+}

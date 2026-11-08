@@ -8,7 +8,7 @@ Tanka 群 ──@bot──▶ agentlink-server ◀──长轮询── agentlin
    └──────── response_url / 群 webhook ◀───────────┘
 ```
 
-- **server**：校验 Tanka 签名，按 `(bot, room_id)` 找到配对的设备，把任务加密后放进该设备在内存里的队列；worker 取走时，任务就从 server 上删掉，回帖去向（`response_url` 等）用 server 的存储密钥封好随任务交给 worker，worker 交回结果时带回来，server 据此回帖，失败再用该群的 incoming webhook。消息不落盘：SQLite 里只有设备、配对和 server 的密钥。
+- **server**：校验 Tanka 签名，按 `(bot, room_id)` 找到配对的设备，把任务加密后放进该设备在内存里的队列；worker 取走时，任务就从 server 上删掉，回帖去向（`response_url` 等）用 server 的存储密钥封好随任务交给 worker，worker 交回结果时带回来，server 据此回帖，失败再用该群的 incoming webhook。消息不落盘：SQLite 里只有设备、配对、server 的密钥和元数据（任务流水、worker 上报的状态，见「元数据与统计」）。
 - **worker**：凭 device id / token 与 server 配对，只发出站请求（不需要公网入口）。每个群在本机有自己的工作目录和当前会话：默认续接当前会话，也可以新建、切回旧会话或换目录。
 - **执行走官方 Agent SDK**：Go 没有官方 SDK，worker 每条 prompt 起一个 `node sdk/runner.mjs`，由它调用 `@anthropic-ai/claude-agent-sdk` 的 `query()`。新会话用 `options.sessionId`（worker 自己生成的 UUID），续接用 `options.resume`，会话 id 不变；SIGTERM 会 abort 这次 query，已做的部分留在会话里。`sdk_options` 原样传给 `query()`。
 
@@ -67,7 +67,7 @@ mirasim 的几点限制：
 ## 加密
 
 - **端到端（server ⇄ worker）**：设备注册时生成 X25519 密钥对并上报公钥，同时记下 server 的公钥。任务在 server 收到的那一刻就用「临时密钥 + 双方长期密钥」派生的 AES-256-GCM 密钥加密给该设备，结果同样加密给 server；附加数据绑定 `task|result <device-id> <task-id>`，所以一个设备的任务不能被另一个设备解开，结果也不能被冒充或挪到别的任务上。中间的 TLS 终止代理（如 Cloudflare）和 server 的数据库都只看到密文。
-- **落盘**：两边都用 SQLite（`modernc.org/sqlite`，纯 Go）。server 只存设备、配对和自己的私钥（用本地存储密钥 `key_path` 加密，首次启动生成，0600），任务和事件 id 都只在内存里；从 0.4 起启动时删掉旧版留下的任务表并 `VACUUM`。随任务交给 worker 的回帖去向也用这把存储密钥封装，worker 解不开也改不了。worker 的身份、令牌、私钥、各群状态和会话标题整体加密存在 `~/.agentlink/worker.db`，密钥在 `~/.agentlink/worker.key`。
+- **落盘**：两边都用 SQLite（`modernc.org/sqlite`，纯 Go）。server 存设备、配对、自己的私钥（用本地存储密钥 `key_path` 加密，首次启动生成，0600）和元数据（见「元数据与统计」），任务内容和事件 id 都只在内存里；从 0.4 起启动时删掉旧版留下的任务表并 `VACUUM`。随任务交给 worker 的回帖去向也用这把存储密钥封装，worker 解不开也改不了。worker 的身份、令牌、私钥、各群状态和会话标题整体加密存在 `~/.agentlink/worker.db`，密钥在 `~/.agentlink/worker.key`。
 - Tanka → server 这一段只能是明文（server 要读命令），靠 Tanka 签名校验。
 
 ## 群里的用法
@@ -129,6 +129,36 @@ GOOS=linux GOARCH=amd64 CGO_ENABLED=0 go build -o bin/agentlink-server ./cmd/age
 - `/healthz` 是存活探针。日志里只有 id，没有正文。
 - 队列只在内存：server 重启会丢掉还没被设备取走的任务（在线设备通常一秒内就取走）；已取走的任务不受影响，结果带着回帖去向回来，照样回帖。没人取的任务 `queue_ttl_sec`（默认 10 分钟）后丢弃并回帖说明，取走但没交结果的 `lease_sec` 后丢弃，晚到的结果不再回帖。
 
+### 元数据与统计
+
+server 不存消息，但会存下面这些，用来管理、对账、排查和统计：
+
+- **任务流水 `task_log`**（保留 90 天）：任务 id、机器人、群 id、设备、来源（`mention` 或触发器名）、发送人（@ 的人的 Tanka id；worker 触发的是设备 id；Sentry 钩子为空）、附件个数、加密后任务和结果的字节数、入队 / 被取走 / 租约到期 / 结束时间、结局：
+  - `posted`：已回帖；
+  - `empty`：worker 没有要发的；
+  - `reply_failed`：Tanka 没收下；
+  - `not_taken`：设备在 `queue_ttl_sec` 内没取；
+  - `no_result`：取走后 `lease_sec` 内没交结果；
+  - `lost`：server 重启时还没被取走。
+
+  不存正文、附件链接和文件名、`response_url`。
+- **设备水位 `device_stats`**：同时在排或在跑的任务数峰值及时间，以及 worker 每次轮询上报的状态：版本、在跑数、排队数、哪些 harness 在用量上限里到几点。这份状态放在请求头里，不加密（没有任务内容）。
+- **重启**：还没被取走的任务记为 `lost`。配了 webhook 的群会收到一条只有数量和来源的说明（如「2 个任务：mention ×1，`alerts` ×1」），没有内容。已取走的任务不受影响。
+- **worker 本地流水** `~/.agentlink/runs.jsonl`（保留 90 天）：
+  - 每次跑 harness 一行：任务 id、触发器、harness、会话、耗时、失败 / 中断、撞到的上限、轮数、花费；
+  - 每次交结果一行：任务 id、字节数，server 没收下时记原因。
+
+  用任务 id 和 server 的流水对账。不记 prompt、回复和群 id。
+
+在 server 上查看：
+
+```bash
+sudo /opt/agentlink/agentlink-server stats -config /etc/agentlink/server.json            # 设备、各群 / 设备 / 来源与发送人的结局分布、等待与运行耗时分位数、最近 20 个任务；-days 改统计天数
+sudo /opt/agentlink/agentlink-server stats -config /etc/agentlink/server.json -task t-…  # 单个任务的全部记录
+```
+
+`stats` 以只读方式打开数据库，可以和 server 同时运行。没有 HTTP 接口。
+
 ### 3. worker（干活的机器）
 
 ```bash
@@ -161,7 +191,7 @@ AGENTLINK_ENROLL_TOKEN=... agentlink-worker
 ## 开发
 
 ```bash
-go test -race ./...    # 加密、签名、多机器人路由、去重、重启不留消息、过期、会话生命周期、触发任务、用量上限与回退、端到端（测试二进制充当 SDK runner、mirasim 和 kimi）
+go test -race ./...    # 加密、签名、多机器人路由、去重、重启不留消息、任务流水与统计、过期、会话生命周期、触发任务、用量上限与回退、端到端（测试二进制充当 SDK runner、mirasim 和 kimi）
 AGENTLINK_REAL_CLAUDE=1 go test -run TestRealSDK ./internal/worker   # 真 Agent SDK：新建会话 + resume，约 $0.02
 AGENTLINK_REAL_KIMI=1 go test -run TestRealKimi ./internal/worker     # 真 kimi：新建会话 + 续接 + 查额度，用一点 Kimi 额度
 ```

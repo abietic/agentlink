@@ -102,6 +102,8 @@ type Worker struct {
 	locks     map[string]*sessionLock
 	marks     map[string]time.Time // trigger dedupe: "seen/<trigger>/<key>" and "ran/<trigger>/<key>"
 	limits    map[string]Limit     // by harness: the usage limit it last hit, until a run on it finishes without one
+
+	runLogMu sync.Mutex
 }
 
 func New(cfg Config) (*Worker, error) {
@@ -135,6 +137,9 @@ func New(cfg Config) (*Worker, error) {
 	}
 	if _, err := st.get("limits", &w.limits); err != nil {
 		return nil, err
+	}
+	if err := pruneRunLog(w.runLogPath(), w.now()); err != nil {
+		log.Printf("run log: %v", err)
 	}
 	var id Identity
 	if _, err := st.get("identity", &id); err != nil {
@@ -200,7 +205,7 @@ func (w *Worker) Run(ctx context.Context) error {
 	var err error
 	for ctx.Err() == nil {
 		var env *proto.Envelope
-		env, err = w.client.Poll(ctx)
+		env, err = w.client.Poll(ctx, w.status())
 		if errors.Is(err, ErrUnauthorized) {
 			break
 		}
@@ -236,6 +241,23 @@ func (w *Worker) Run(ctx context.Context) error {
 		return err
 	}
 	return ctx.Err()
+}
+
+// status is what this worker tells the server about itself with each poll.
+func (w *Worker) status() proto.WorkerStatus {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	st := proto.WorkerStatus{Version: proto.Version, Running: len(w.running)}
+	for _, q := range w.queues {
+		st.Queued += len(q.tasks)
+	}
+	st.Queued = max(st.Queued-st.Running, 0) // a queue's head is the one running
+	for _, h := range slices.Sorted(maps.Keys(w.cfg.Harnesses)) {
+		if l, ok := w.limitedLocked(h); ok {
+			st.Limits = append(st.Limits, proto.HarnessLimit{Harness: h, Limit: l.Name, Until: l.ResetsAt})
+		}
+	}
+	return st
 }
 
 func (w *Worker) dispatch(ctx context.Context, t proto.Task) {
@@ -354,10 +376,13 @@ func (w *Worker) send(t proto.Task, text string) {
 
 // post seals and posts a result, retrying only when the request may not have reached the server.
 func (w *Worker) post(t proto.Task, text string) {
+	rec := runRecord{Event: "result", Task: t.ID, Trigger: t.Trigger, Bytes: len(text)}
+	defer func() { w.logRun(rec) }()
 	plain, _ := json.Marshal(proto.Result{Text: text})
 	sealed, err := seal.Seal(w.key, w.serverKey, proto.ResultContext(w.id.DeviceID, t.ID), plain)
 	if err != nil {
 		log.Printf("task %s: seal result: %v", t.ID, err)
+		rec.Error = "seal: " + err.Error()
 		return
 	}
 	for attempt := 1; ; attempt++ {
@@ -370,6 +395,7 @@ func (w *Worker) post(t proto.Task, text string) {
 		var ue *url.Error
 		if !errors.As(err, &ue) || attempt == 3 {
 			log.Printf("task %s: result not delivered: %v", t.ID, err)
+			rec.Error = err.Error()
 			return
 		}
 		time.Sleep(time.Duration(attempt) * 2 * time.Second)
@@ -647,6 +673,12 @@ func (w *Worker) attempt(ctx context.Context, t proto.Task, run Run, current boo
 	}
 	w.mu.Unlock()
 	log.Printf("task %s: finished in %s (error=%v, limit=%v)", t.ID, res.Duration.Round(time.Second), err != nil || res.IsError, res.Limit != nil)
+	rec := runRecord{Event: "run", Task: t.ID, Trigger: t.Trigger, Harness: run.Harness, Session: cmp.Or(res.SessionID, run.SessionID),
+		Seconds: res.Duration.Seconds(), Failed: err != nil || res.IsError, Stopped: res.Stopped, Turns: res.Turns, CostUSD: res.CostUSD}
+	if res.Limit != nil {
+		rec.Limit = cmp.Or(res.Limit.Name, "unnamed")
+	}
+	w.logRun(rec)
 	return res, err
 }
 

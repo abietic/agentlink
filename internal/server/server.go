@@ -8,8 +8,10 @@
 // included) sees its content. Where the result goes travels with the task, boxed with the
 // server's storage key, and comes back with the result; once a device has a task, the server
 // keeps only what it needs to say the task was dropped, and a restart loses nothing but tasks
-// still waiting. SQLite holds only devices, room bindings and the server's key. Logs carry
-// ids, never message text.
+// still waiting. SQLite holds devices, room bindings, the server's key, and metadata: a log
+// of what became of each task (ids, times, sizes, outcome; kept 90 days) and what each worker
+// last reported about itself. Neither the database nor the logs hold message text or where a
+// reply goes.
 package server
 
 import (
@@ -71,6 +73,31 @@ CREATE TABLE IF NOT EXISTS bindings (
 -- Tasks and seen event ids were kept here before 0.4; they live in memory now.
 DROP TABLE IF EXISTS tasks;
 DROP TABLE IF EXISTS events;
+-- What became of each task, never its content or where its reply goes; see tasklog.go.
+CREATE TABLE IF NOT EXISTS task_log (
+	id TEXT PRIMARY KEY,
+	bot TEXT NOT NULL,
+	room_id TEXT NOT NULL,
+	device_id TEXT NOT NULL,
+	source TEXT NOT NULL,          -- "mention", or the trigger's name
+	sender TEXT NOT NULL,          -- who mentioned the bot; the device that sent a trigger; "" for a server hook
+	attachments INTEGER NOT NULL,
+	task_bytes INTEGER NOT NULL,   -- sealed, as sent to the device
+	result_bytes INTEGER NOT NULL DEFAULT 0,
+	queued_at INTEGER NOT NULL,    -- unix ms
+	leased_at INTEGER,
+	lease_until INTEGER,
+	done_at INTEGER,
+	outcome TEXT                   -- NULL while waiting or running
+);
+CREATE INDEX IF NOT EXISTS task_log_queued_at ON task_log (queued_at);
+CREATE TABLE IF NOT EXISTS device_stats (
+	device_id TEXT PRIMARY KEY,
+	status TEXT NOT NULL DEFAULT '',        -- the worker's last proto.WorkerStatus, JSON
+	status_at INTEGER NOT NULL DEFAULT 0,
+	peak_queue INTEGER NOT NULL DEFAULT 0,  -- most tasks waiting or running at once
+	peak_at INTEGER NOT NULL DEFAULT 0
+);
 `
 
 const helpText = `**agentlink** runs what you write on the device paired with this room, through its harness (the Claude Agent SDK, or mirasim).
@@ -168,6 +195,7 @@ func New(cfg Config) (*Server, error) {
 			}
 		}
 	}
+	s.markLost()
 	return s, nil
 }
 
@@ -408,7 +436,7 @@ func (s *Server) enqueue(bot *Bot, ev tanka.MentionEvent, text string) {
 		for _, a := range ev.Attachments {
 			t.Attachments = append(t.Attachments, proto.Attachment{URL: a.URL, Name: a.Name})
 		}
-		id, err := s.insertTask(bot, d, t, ev.ResponseURL)
+		id, err := s.insertTask(bot, d, t, ev.UserID, ev.ResponseURL)
 		switch {
 		case err == nil:
 			log.Printf("task %s queued bot=%s room=%s user=%s device=%s attachments=%d", id, bot.Name, ev.RoomID, ev.UserID, d.ID, len(t.Attachments))
@@ -426,8 +454,9 @@ func (s *Server) enqueue(bot *Bot, ev tanka.MentionEvent, text string) {
 var errQueueFull = fmt.Errorf("already has %d tasks waiting or running", maxQueuePerDev)
 
 // insertTask fills in t's id and time, seals it to d and queues it in memory; responseURL
-// may be empty. It refuses once d has maxQueuePerDev tasks waiting or running.
-func (s *Server) insertTask(bot *Bot, d *device, t proto.Task, responseURL string) (string, error) {
+// may be empty. sender is who asked for it, for the task log. It refuses once d has
+// maxQueuePerDev tasks waiting or running.
+func (s *Server) insertTask(bot *Bot, d *device, t proto.Task, sender, responseURL string) (string, error) {
 	id := "t-" + randHex(6)
 	t.ID, t.CreatedAt = id, s.now()
 	plain, err := json.Marshal(t)
@@ -450,14 +479,16 @@ func (s *Server) insertTask(bot *Bot, d *device, t proto.Task, responseURL strin
 		return "", errQueueFull
 	}
 	s.waiting[d.ID] = append(s.waiting[d.ID], &task{id: id, dev: d.ID, bot: bot.Name, room: t.RoomID, sealed: sealed, reply: responseURL, created: s.now()})
+	s.logQueued(id, bot.Name, d.ID, t, sender, len(sealed), n+1) // under mu, so a lease cannot log first
 	s.mu.Unlock()
 	s.signal(d.ID)
 	return id, nil
 }
 
-// trigger queues a task nobody typed for the device bound to roomID. It is queued even if
-// the device is offline; if nobody picks it up, it expires without a reply.
-func (s *Server) trigger(bot *Bot, roomID, name, key, text string) (string, error) {
+// trigger queues a task nobody typed for the device bound to roomID; from is the device
+// that asked for it, or "" for a server hook. It is queued even if the device is offline; if
+// nobody picks it up, it expires without a reply.
+func (s *Server) trigger(bot *Bot, roomID, name, key, text, from string) (string, error) {
 	d, err := s.deviceWhere(`id = (SELECT device_id FROM bindings WHERE bot = ? AND room_id = ?)`, bot.Name, roomID)
 	if errors.Is(err, sql.ErrNoRows) {
 		return "", errors.New("room is not bound to a registered device")
@@ -465,7 +496,7 @@ func (s *Server) trigger(bot *Bot, roomID, name, key, text string) (string, erro
 	if err != nil {
 		return "", err
 	}
-	id, err := s.insertTask(bot, d, proto.Task{RoomID: roomID, Text: text, Trigger: name, Key: key}, "")
+	id, err := s.insertTask(bot, d, proto.Task{RoomID: roomID, Text: text, Trigger: name, Key: key}, from, "")
 	if err != nil {
 		return "", fmt.Errorf("device %s: %w", d.ID, err)
 	}
@@ -499,7 +530,7 @@ func (s *Server) handleTrigger(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "the device's bot is no longer configured", http.StatusConflict)
 		return
 	}
-	id, err := s.trigger(bot, req.RoomID, body.Trigger, body.Key, body.Text)
+	id, err := s.trigger(bot, req.RoomID, body.Trigger, body.Key, body.Text, d.ID)
 	if err != nil {
 		log.Printf("trigger from %s for room %s: %v", d.ID, req.RoomID, err)
 		http.Error(w, "not queued: "+err.Error(), http.StatusConflict)
@@ -578,6 +609,7 @@ func (s *Server) handlePoll(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "unauthorized", http.StatusUnauthorized)
 		return
 	}
+	s.noteStatus(d.ID, r.Header.Get(proto.HeaderWorkerStatus))
 	timer := time.NewTimer(s.cfg.PollWait())
 	defer timer.Stop()
 	for {
@@ -627,6 +659,7 @@ func (s *Server) lease(dev string) (*proto.Envelope, error) {
 	t.sealed, t.until = nil, s.now().Add(s.cfg.lease())
 	s.leased[t.id] = t
 	s.mu.Unlock()
+	s.logLeased(t.id, t.until)
 	plain, _ := json.Marshal(replyTo{Dev: t.dev, Bot: t.bot, Room: t.room, URL: t.reply, Until: t.until.UnixMilli()})
 	boxed, err := seal.Box(s.key, "reply "+t.id, plain)
 	if err != nil {
@@ -690,15 +723,18 @@ func (s *Server) handleResult(w http.ResponseWriter, r *http.Request) {
 	}
 	if res.Text == "" {
 		log.Printf("task %s done room=%s (nothing to post)", id, rt.Room)
+		s.logDone(id, outEmpty, len(env.Sealed))
 		writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
 		return
 	}
 	if err := s.reply(s.bots[rt.Bot], rt.Room, rt.URL, res.Text); err != nil {
 		log.Printf("task %s: reply failed: %v", id, err)
+		s.logDone(id, outReplyFailed, len(env.Sealed))
 		http.Error(w, "reply failed", http.StatusBadGateway)
 		return
 	}
 	log.Printf("task %s done room=%s", id, rt.Room)
+	s.logDone(id, outPosted, len(env.Sealed))
 	writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
 }
 
@@ -730,11 +766,13 @@ func (s *Server) reapExpired(now time.Time) {
 		}
 	}
 	s.mu.Unlock()
+	s.sweepLog(now)
 	for _, t := range dropped {
-		msg := fmt.Sprintf("Device `%s` did not pick this task up within %s, so it was dropped.", t.dev, s.cfg.queueTTL())
+		msg, outcome := fmt.Sprintf("Device `%s` did not pick this task up within %s, so it was dropped.", t.dev, s.cfg.queueTTL()), outNotTaken
 		if !t.until.IsZero() {
-			msg = fmt.Sprintf("Device `%s` took this task but sent no result within %s, so it was dropped.", t.dev, s.cfg.lease())
+			msg, outcome = fmt.Sprintf("Device `%s` took this task but sent no result within %s, so it was dropped.", t.dev, s.cfg.lease()), outNoResult
 		}
+		s.logDone(t.id, outcome, 0)
 		log.Printf("task %s expired on device %s", t.id, t.dev)
 		// Only a mention gets told: a triggered task has no response_url, and an asleep
 		// laptop would otherwise fill the room with notices.

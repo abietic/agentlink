@@ -7,6 +7,29 @@ import (
 	"unicode"
 )
 
+// Version is the release a binary was built from; the release build sets it with
+// -ldflags "-X agentlink/internal/proto.Version=<tag>".
+var Version = "dev"
+
+// HeaderWorkerStatus carries a WorkerStatus as JSON on each poll. It holds no task content,
+// so it travels unsealed.
+const HeaderWorkerStatus = "Agentlink-Worker-Status"
+
+// WorkerStatus is what a worker tells the server about itself with each poll.
+type WorkerStatus struct {
+	Version string         `json:"version"`
+	Running int            `json:"running"` // runs in progress
+	Queued  int            `json:"queued"`  // tasks it has taken but not started
+	Limits  []HarnessLimit `json:"limits,omitempty"`
+}
+
+// HarnessLimit is a harness resting at a usage limit.
+type HarnessLimit struct {
+	Harness string    `json:"harness"`
+	Limit   string    `json:"limit,omitempty"` // the harness's own name for it
+	Until   time.Time `json:"until"`
+}
+
 // Task is one @-mention routed to a worker device. It travels sealed (see Envelope).
 type Task struct {
 	ID        string    `json:"id"`

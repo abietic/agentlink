@@ -22,7 +22,7 @@ jobs:
         run: |
           set -euo pipefail
           mkdir dist
-          build() { CGO_ENABLED=0 GOOS=$1 GOARCH=$2 go build -trimpath -ldflags "-s -w" -o "dist/$3-$1-$2" "./cmd/$3"; }
+          build() { CGO_ENABLED=0 GOOS=$1 GOARCH=$2 go build -trimpath -ldflags "-s -w -X agentlink/internal/proto.Version=$GITHUB_REF_NAME" -o "dist/$3-$1-$2" "./cmd/$3"; }
           build linux amd64 agentlink-server
           build linux arm64 agentlink-server
           build darwin arm64 agentlink-worker

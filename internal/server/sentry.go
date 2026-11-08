@@ -85,7 +85,7 @@ func (s *Server) handleSentry(w http.ResponseWriter, r *http.Request) {
 		"{project}", ev.Project.String(),
 	).Replace(bot.Sentry.Prompt)
 	h := bot.Sentry
-	id, err := s.trigger(bot, h.RoomID, h.Trigger, "sentry:"+ev.IssueID.String(), text)
+	id, err := s.trigger(bot, h.RoomID, h.Trigger, "sentry:"+ev.IssueID.String(), text, "")
 	if err != nil {
 		log.Printf("bot %s: sentry alert for issue %s not queued: %v", bot.Name, ev.IssueID, err)
 		http.Error(w, "not queued", http.StatusServiceUnavailable)
