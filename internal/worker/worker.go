@@ -269,7 +269,11 @@ func (w *Worker) dispatch(ctx context.Context, t proto.Task) {
 		}
 	} else if !slices.Contains(w.cfg.AllowedUsers, t.UserID) && !slices.Contains(w.cfg.AllowedBots, t.UserID) {
 		log.Printf("task %s: user %s is in neither allowed_users nor allowed_bots", t.ID, t.UserID)
-		// Not mentioned: the sender may be a bot, which would answer the mention with its own refusal.
+		if t.SenderType == "bot" {
+			go w.post(t, "") // posts nothing: a bot may answer whatever it is told
+			return
+		}
+		// Not mentioned: a server from before SenderType does not say whether the sender is a bot.
 		go w.post(t, fmt.Sprintf("User `%s` may not use device `%s`. Its owner can add that id to `allowed_users` (a person) or `allowed_bots` (a bot) in the worker config.", t.UserID, w.id.DeviceID))
 		return
 	} else if cmd := parseCommand(t.Text); cmd.name == "status" || cmd.name == "sessions" {
@@ -406,10 +410,11 @@ func (w *Worker) post(t proto.Task, text string) {
 var mentionable = regexp.MustCompile(`^[0-9A-Za-z]{8,64}$`)
 
 // mentionSender puts a mention of whoever sent t on a line of its own above the reply, so
-// Tanka notifies them when it lands. Triggered tasks have no sender, and an empty reply posts
+// Tanka notifies them when it lands. Triggered tasks have no sender, a bot would answer the
+// mention, and an empty reply posts
 // nothing.
 func mentionSender(t proto.Task, text string) string {
-	if text == "" || t.Trigger != "" || !mentionable.MatchString(t.UserID) {
+	if text == "" || t.Trigger != "" || t.SenderType == "bot" || !mentionable.MatchString(t.UserID) {
 		return text
 	}
 	return "<@" + t.UserID + ">\n\n" + text

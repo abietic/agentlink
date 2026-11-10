@@ -132,6 +132,16 @@ type Server struct {
 	waiting map[string][]*task       // device → tasks it has not taken yet, oldest first
 	leased  map[string]*task         // task id → a task a device has taken (without its content)
 	seen    map[string]time.Time     // dedupe key → when to forget it
+	hops    map[string]*botHops      // room → bot-sent mentions since a person's
+}
+
+// maxBotHops is how many bot-sent mentions in a row a room takes before a person has to
+// mention a bot again. Bots that answer each other would otherwise never stop.
+const maxBotHops = 3
+
+type botHops struct {
+	n    int
+	last time.Time
 }
 
 // task is a queued or taken task. Its content leaves the server with the device.
@@ -179,6 +189,7 @@ func New(cfg Config) (*Server, error) {
 		waiting: map[string][]*task{},
 		leased:  map[string]*task{},
 		seen:    map[string]time.Time{},
+		hops:    map[string]*botHops{},
 	}
 	for i := range s.cfg.Bots {
 		s.bots[s.cfg.Bots[i].Name] = &s.cfg.Bots[i]
@@ -336,16 +347,38 @@ func (s *Server) firstSeen(key string, ttl time.Duration) bool {
 func (s *Server) onMention(bot *Bot, ev tanka.MentionEvent) {
 	// sender_type is not in Tanka's docs; its value (not message content) says whether bots' mentions arrive.
 	log.Printf("bot %s: mention room=%s user=%s sender_type=%q", bot.Name, ev.RoomID, ev.UserID, ev.SenderType)
+	fromBot := ev.SenderType == "bot"
 	if len(s.cfg.AllowedUsers) > 0 && !slices.Contains(s.cfg.AllowedUsers, ev.UserID) {
 		log.Printf("bot %s room=%s user=%s: not in allowed_users", bot.Name, ev.RoomID, ev.UserID)
-		s.replyAsync(bot, ev.RoomID, ev.ResponseURL, fmt.Sprintf("User `%s` is not allowed to use this bot.", ev.UserID))
+		if !fromBot { // a bot gets no answer: it may answer back
+			s.replyAsync(bot, ev.RoomID, ev.ResponseURL, fmt.Sprintf("User `%s` is not allowed to use this bot.", ev.UserID))
+		}
 		return
 	}
 	text := stripMention(ev.Text, bot.Mentions)
+	if fromBot {
+		switch n := s.botHop(ev.RoomID); {
+		case n == maxBotHops+1:
+			log.Printf("bot %s room=%s: %d bot-sent mentions in a row, stopping", bot.Name, ev.RoomID, n)
+			s.replyAsync(bot, ev.RoomID, ev.ResponseURL, fmt.Sprintf("Stopped here: %d mentions in a row came from bots. A person has to mention a bot before bots can hand on work in this room again.", maxBotHops))
+			return
+		case n > maxBotHops:
+			log.Printf("bot %s room=%s: bot-sent mention %d in a row dropped", bot.Name, ev.RoomID, n)
+			return
+		}
+		text = afterMention(ev.Text, bot.Mentions)
+	} else {
+		s.mu.Lock()
+		delete(s.hops, ev.RoomID)
+		s.mu.Unlock()
+	}
 	word, arg := proto.CutWord(text)
 	switch kw := proto.Keyword(word); {
 	case kw == "" && len(ev.Attachments) == 0, kw == "help": // an image alone is a prompt
 		s.replyAsync(bot, ev.RoomID, ev.ResponseURL, helpText)
+	case (kw == "pair" || kw == "unpair") && fromBot:
+		// Which device a room drives is for the people in it to decide.
+		log.Printf("bot %s room=%s user=%s: %s from a bot ignored", bot.Name, ev.RoomID, ev.UserID, kw)
 	case kw == "pair":
 		s.replyAsync(bot, ev.RoomID, ev.ResponseURL, s.pair(bot, ev, arg))
 	case kw == "unpair":
@@ -353,6 +386,41 @@ func (s *Server) onMention(bot *Bot, ev tanka.MentionEvent) {
 	default:
 		s.enqueue(bot, ev, text)
 	}
+}
+
+// botHop counts a bot-sent mention in room and returns how many have arrived in a row. A
+// person's mention starts the count again, and so does a quiet spell of two leases: bots
+// answering each other are never that slow, since a result later than its lease is refused.
+func (s *Server) botHop(room string) int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	h := s.hops[room]
+	if h == nil || s.now().Sub(h.last) > 2*s.cfg.lease() {
+		h = &botHops{}
+		s.hops[room] = h
+	}
+	h.n, h.last = h.n+1, s.now()
+	return h.n
+}
+
+// afterMention returns what follows the first "@<configured name>" in a bot's message, so the
+// bot handing work on can write to its own reader first. Tanka delivers every mention as
+// "@Display Name". Without one it falls back to stripMention.
+func afterMention(text string, names []string) string {
+	at := -1
+	var rest string
+	for _, n := range names {
+		if n == "" {
+			continue
+		}
+		if i := strings.Index(text, "@"+n); i >= 0 && (at < 0 || i < at) {
+			at, rest = i, text[i+1+len(n):]
+		}
+	}
+	if at < 0 {
+		return stripMention(text, names)
+	}
+	return strings.TrimSpace(rest)
 }
 
 // stripMention removes the leading bot mention: "<@ID>", "@<configured name>", or else "@word".
@@ -432,7 +500,7 @@ func (s *Server) enqueue(bot *Bot, ev tanka.MentionEvent, text string) {
 		// Not queued: a prompt that runs hours later, when the laptop wakes up, would surprise.
 		msg = fmt.Sprintf("Device `%s` is offline (last seen %s), so nothing was queued.", d.ID, s.ago(d.LastSeen))
 	default:
-		t := proto.Task{RoomID: ev.RoomID, RoomName: ev.RoomName, UserID: ev.UserID, UserName: ev.UserName, Text: text}
+		t := proto.Task{RoomID: ev.RoomID, RoomName: ev.RoomName, UserID: ev.UserID, UserName: ev.UserName, Text: text, SenderType: ev.SenderType}
 		for _, a := range ev.Attachments {
 			t.Attachments = append(t.Attachments, proto.Attachment{URL: a.URL, Name: a.Name})
 		}

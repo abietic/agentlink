@@ -250,6 +250,7 @@ func TestMentionSender(t *testing.T) {
 		{proto.Task{UserID: "all"}, "done", "done"},                 // never <@all>
 		{proto.Task{UserID: "x> <@all"}, "done", "done"},            // nor anything that is not an id
 		{proto.Task{UserID: ""}, "done", "done"},
+		{proto.Task{UserID: id, SenderType: "bot"}, "done", "done"}, // a bot would answer the mention
 	} {
 		if got := mentionSender(tc.t, tc.in); got != tc.want {
 			t.Errorf("mentionSender(%+v, %q) = %q, want %q", tc.t, tc.in, got, tc.want)
@@ -427,8 +428,22 @@ func TestEndToEnd(t *testing.T) {
 	if r := say("6a7d7188238a191436b929dc", "hi"); strings.Contains(r, "<@") || !strings.Contains(r, "may not use device") {
 		t.Fatalf("a refused sender is mentioned: %q", r)
 	}
+	// A bot nobody allowed gets no answer at all: the next reply is the one to the person after it.
+	n++
+	body, _ := json.Marshal(tanka.Envelope{Type: "event_callback", EventID: fmt.Sprint("e", n), Event: &tanka.MentionEvent{
+		Type: "app_mention", UserID: "b07b07b07b07b07b07b07b07", SenderType: "bot", RoomID: "room-canary-77", Text: "@bot hi", ResponseURL: fake.URL + "/hooks/response/" + strconv.Itoa(n),
+	}})
+	ts := strconv.FormatInt(time.Now().Unix(), 10)
+	req, _ := http.NewRequest(http.MethodPost, hs.URL+"/tanka/events", bytes.NewReader(body))
+	req.Header.Set(tanka.HeaderTimestamp, ts)
+	req.Header.Set(tanka.HeaderSignature, tanka.Sign([]byte(signing), ts, body))
+	if resp, err := http.DefaultClient.Do(req); err != nil {
+		t.Fatal(err)
+	} else {
+		resp.Body.Close()
+	}
 	if r := say("U1", "status"); !strings.Contains(r, "**Workdir** `") {
-		t.Fatalf("status: %q", r)
+		t.Fatalf("status, or a refused bot was answered: %q", r)
 	}
 	if r := say("U9", "rm -rf everything"); !strings.Contains(r, "`U9` may not use device") {
 		t.Fatalf("stranger: %q", r)
@@ -448,7 +463,7 @@ func TestEndToEnd(t *testing.T) {
 	// Refusals and status are posted on their own goroutines, which log once the server answers.
 	var runs []byte
 	for deadline := time.Now().Add(5 * time.Second); time.Now().Before(deadline); time.Sleep(20 * time.Millisecond) {
-		if runs, _ = os.ReadFile(filepath.Join(f.cfg.StateDir, "runs.jsonl")); bytes.Count(runs, []byte(`"event":"result"`)) >= 7 {
+		if runs, _ = os.ReadFile(filepath.Join(f.cfg.StateDir, "runs.jsonl")); bytes.Count(runs, []byte(`"event":"result"`)) >= 8 {
 			break
 		}
 	}
@@ -463,8 +478,9 @@ func TestEndToEnd(t *testing.T) {
 		}
 		events[r.Event]++
 	}
-	// Pairing and early "offline" pings are the server's; the worker answered 7 mentions and ran 4.
-	if events["run"] != 4 || events["result"] != 7 {
+	// Pairing and early "offline" pings are the server's; the worker answered 7 mentions, ran 4
+	// of them, and closed the refused bot's task with an empty result.
+	if events["run"] != 4 || events["result"] != 8 {
 		t.Errorf("run log events: %v\n%s", events, runs)
 	}
 	var stats bytes.Buffer

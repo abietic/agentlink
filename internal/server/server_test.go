@@ -13,6 +13,7 @@ import (
 	"slices"
 	"strconv"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -492,5 +493,114 @@ func TestImageOnlyMention(t *testing.T) {
 	want := []proto.Attachment{{URL: "https://gw-tk.tanka.ai/npc/v2/file/abc", Name: "shot.png"}}
 	if task == nil || task.Text != "" || !slices.Equal(task.Attachments, want) {
 		t.Fatalf("task = %+v", task)
+	}
+}
+
+// botMention is a mention a bot or a webhook sent, as Tanka has delivered them since 2026-11-05.
+func botMention(ft *fakeTanka, room, user, text string) tanka.Envelope {
+	ev := mention(ft, room, user, text)
+	ev.Event.SenderType = "bot"
+	return ev
+}
+
+// TestBotSendersCannotPair checks that only a person binds a room: a bot's pair and unpair
+// are dropped without an answer, and its prompt still reaches the device.
+func TestBotSendersCannotPair(t *testing.T) {
+	_, base, ft := newTestServer(t, nil)
+	dev := register(t, base, "")
+
+	sendEvent(t, base, botMention(ft, "R1", "B1", "@Agent Link pair "+dev.DeviceID))
+	ft.quiet(t)
+	sendEvent(t, base, mention(ft, "R1", "U1", "@Agent Link hi"))
+	if p := ft.next(t); !strings.Contains(p.text, "not paired") {
+		t.Fatalf("a bot paired the room: %q", p.text)
+	}
+
+	sendEvent(t, base, mention(ft, "R1", "U1", "@Agent Link pair "+dev.DeviceID))
+	ft.next(t)
+	dev.poll(t)
+	sendEvent(t, base, botMention(ft, "R1", "B1", "@Agent Link unpair"))
+	ft.quiet(t)
+
+	sendEvent(t, base, botMention(ft, "R1", "B1", "@Lee\n\nreview is done.\n\n@Agent Link fix the two findings\n\n`footer`"))
+	task := dev.poll(t)
+	if task == nil || task.Text != "fix the two findings\n\n`footer`" || task.SenderType != "bot" || task.UserID != "B1" {
+		t.Fatalf("a bot unpaired the room, or its task is wrong: %+v", task)
+	}
+	sendEvent(t, base, mention(ft, "R1", "U1", "@Lee look, @Agent Link fix it"))
+	if task := dev.poll(t); task == nil || task.Text != "look, @Agent Link fix it" || task.SenderType != "" {
+		t.Fatalf("a person's message lost its start: %+v", task)
+	}
+}
+
+func TestBotSenderNotAllowedGetsNoAnswer(t *testing.T) {
+	_, base, ft := newTestServer(t, func(c *Config) { c.AllowedUsers = []string{"U1"} })
+	sendEvent(t, base, botMention(ft, "R1", "B1", "@Agent Link help"))
+	ft.quiet(t)
+}
+
+// TestBotHopLimit checks that a room takes maxBotHops bot-sent mentions in a row, says once
+// that it stopped, and starts again after a person's mention or a long quiet spell.
+func TestBotHopLimit(t *testing.T) {
+	s, base, ft := newTestServer(t, nil)
+	now := time.Now()
+	var mu sync.Mutex
+	s.now = func() time.Time { mu.Lock(); defer mu.Unlock(); return now }
+	help := func(ev tanka.Envelope) {
+		t.Helper()
+		sendEvent(t, base, ev)
+		if p := ft.next(t); !strings.Contains(p.text, "**agentlink**") {
+			t.Fatalf("reply: %q", p.text)
+		}
+	}
+	fill := func() {
+		t.Helper()
+		for range maxBotHops {
+			help(botMention(ft, "R1", "B1", "@Agent Link help"))
+		}
+	}
+
+	fill()
+	sendEvent(t, base, botMention(ft, "R1", "B2", "@Agent Link help"))
+	if p := ft.next(t); !strings.Contains(p.text, "Stopped here") || strings.Contains(p.text, "@") {
+		t.Fatalf("over the limit: %q", p.text)
+	}
+	sendEvent(t, base, botMention(ft, "R1", "B1", "@Agent Link help"))
+	ft.quiet(t)
+	help(botMention(ft, "R2", "B1", "@Agent Link help")) // another room counts on its own
+
+	help(mention(ft, "R1", "U1", "@Agent Link help"))
+	fill()
+	sendEvent(t, base, botMention(ft, "R1", "B1", "@Agent Link help"))
+	if p := ft.next(t); !strings.Contains(p.text, "Stopped here") {
+		t.Fatalf("over the limit again: %q", p.text)
+	}
+
+	mu.Lock()
+	now = now.Add(2*s.cfg.lease() + time.Second)
+	later := now
+	mu.Unlock()
+	body, _ := json.Marshal(botMention(ft, "R1", "B1", "@Agent Link help"))
+	if resp := signedPost(t, base+"/tanka/events", secret, body, later); resp.StatusCode != http.StatusOK {
+		t.Fatalf("event: HTTP %d", resp.StatusCode)
+	}
+	if p := ft.next(t); !strings.Contains(p.text, "**agentlink**") {
+		t.Fatalf("after a quiet spell: %q", p.text)
+	}
+}
+
+func TestAfterMention(t *testing.T) {
+	names := []string{"Agent Link", "AL"}
+	for in, want := range map[string]string{
+		"@Agent Link status":                     "status",
+		"@Lee\n\n@Agent Link help\n\n`footer`":   "help\n\n`footer`",
+		"done. @AL next, then @Agent Link again": "next, then @Agent Link again",
+		"hi @Agent Link one, @AL two":            "one, @AL two",
+		"<@B123> cd ~/Code/x":                    "cd ~/Code/x",
+		"no mention here":                        "no mention here",
+	} {
+		if got := afterMention(in, names); got != want {
+			t.Errorf("afterMention(%q) = %q, want %q", in, got, want)
+		}
 	}
 }

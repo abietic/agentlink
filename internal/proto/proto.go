@@ -32,13 +32,15 @@ type HarnessLimit struct {
 
 // Task is one @-mention routed to a worker device. It travels sealed (see Envelope).
 type Task struct {
-	ID        string    `json:"id"`
-	RoomID    string    `json:"room_id"`
-	RoomName  string    `json:"room_name"`
-	UserID    string    `json:"user_id"`
-	UserName  string    `json:"user_name"`
-	Text      string    `json:"text"` // message text with the leading bot mention removed
-	CreatedAt time.Time `json:"created_at"`
+	ID       string `json:"id"`
+	RoomID   string `json:"room_id"`
+	RoomName string `json:"room_name"`
+	UserID   string `json:"user_id"`
+	UserName string `json:"user_name"`
+	Text     string `json:"text"` // message text with the leading bot mention removed
+	// SenderType is Tanka's sender_type: "bot" when another bot or a webhook sent the mention.
+	SenderType string    `json:"sender_type,omitempty"`
+	CreatedAt  time.Time `json:"created_at"`
 	// Trigger names the source of a task nobody typed: a worker trigger, or a server hook
 	// such as "sentry". It runs in a new session, which becomes the room's current one.
 	Trigger string `json:"trigger,omitempty"`
