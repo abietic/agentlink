@@ -2,7 +2,9 @@
 //
 // stdin:  {"cwd", "prompt", "session_id", "resume", "images", "options"} — options go to query();
 //         images ([{media_type, data (base64)}]) go in the prompt's message, before its text
-// stdout: one JSON line, {"type":"result", ...} or {"type":"error", "error", "session_id"}; either
+// stdout: JSON lines. {"type":"progress", "session_id"} at the start and for every message the
+//         SDK yields (no content: the worker only watches that the run is alive), then one last
+//         line, {"type":"result", ...} or {"type":"error", "error", "session_id"}; either
 //         carries "rate_limit": {"type", "resets_at"} when the run stopped at a usage limit
 // SIGTERM aborts the query; the session keeps what was done so far.
 import { query } from '@anthropic-ai/claude-agent-sdk';
@@ -32,9 +34,11 @@ if (req.images?.length) {
     yield { type: 'user', message: { role: 'user', content }, parent_tool_use_id: null, session_id: req.session_id };
   })();
 }
+print({ type: 'progress', session_id: sessionId });
 try {
   for await (const m of query({ prompt, options })) {
     if (m.session_id) sessionId = m.session_id;
+    print({ type: 'progress', session_id: sessionId });
     if (m.type === 'rate_limit_event') limitInfo = m.rate_limit_info;
     if (m.type === 'assistant' && m.error === 'rate_limit') {
       // Retries are over by now. The SDK sends the limit as a rate_limit_event first; a

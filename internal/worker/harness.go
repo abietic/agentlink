@@ -106,14 +106,14 @@ func (c *Config) checkHarnesses() error {
 	return nil
 }
 
-func (h Harness) runner(timeout time.Duration) Runner {
+func (h Harness) runner(timeout, stall time.Duration) Runner {
 	switch h.Type {
 	case "mirasim":
 		return Mirasim{Command: h.Command, Port: h.Port, Agent: h.Agent, Model: h.Model, Effort: h.Effort, Route: h.Route, Members: h.Members, Timeout: timeout}
 	case "kimi":
 		return Kimi{Command: h.Command, Model: h.Model, Timeout: timeout}
 	}
-	return SDK{Command: h.Runner, Options: h.SDKOptions, Timeout: timeout}
+	return SDK{Command: h.Runner, Options: h.SDKOptions, Timeout: timeout, Stall: stall}
 }
 
 // Mirasim runs a prompt with `mirasim ui-cli prompt`, which blocks until the turn settles or

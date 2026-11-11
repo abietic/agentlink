@@ -93,7 +93,7 @@ mirasim 的几点限制：
 
 ## 触发式任务（没人 @ 也能跑）
 
-Tanka 不会把机器人或 incoming webhook 发出的 @ 投递成 `app_mention`，所以「一个机器人 @ 另一个机器人」触发不了任务。没人发消息也要跑的任务走下面两条路，两条可以同时用：
+没人发消息也要跑的任务走下面两条路，两条可以同时用（机器人之间互相 @ 交接工作见「安全模型」）：
 
 1. **server 的 Sentry 钩子**：在 Sentry 建一个 Internal Integration，webhook 填 `https://<server 域名>/sentry/<bot name>`，在告警规则里加这个 integration 作为动作。server 用 client secret 校验 `Sentry-Hook-Signature`，按 `Request-ID` 去重，只处理 `event_alert`，把告警按 `sentry.prompt` 模板（可用 `{issue_id}` `{title}` `{url}` `{rule}` `{project}`）变成任务，交给 `sentry.room_id` 绑定的设备。
 2. **worker 的 `triggers[].command`**：worker 每 `every_sec` 秒跑一次这个命令，stdout 每行一个 `{"key": ..., "at": RFC3339 时间, "text": prompt}`。某个 key 出现了比上次更新的 `at` 就排一个任务；第一次见到、但已经超过 `max_age_sec` 的不排。这样可以先在本机轮询，等 Sentry 那边配好推送再并行。
@@ -107,6 +107,45 @@ Tanka 不会把机器人或 incoming webhook 发出的 @ 投递成 `app_mention`
 - 排队：群自己的命令和当前会话的 prompt 排一队；指名某个会话的消息只跟同一会话排队；每个触发任务单独一队。不同队列并行，总数受 `max_concurrency` 限制；同一个会话无论从哪个队列来，同一时刻只跑一个。
 - 结果没有 `response_url`，只能发到群的 incoming webhook，所以该群必须配 `room_webhooks`。空结果不发；排队超时的触发任务静默丢弃。
 - server 的 `rooms`（群 id → device id）在启动时写入绑定，触发用的群不必有人去发 `pair`。
+
+### 停滞检测与中断后续跑
+
+两个互相独立的配置块，默认都关着；不配就是原来的行为：一次跑到 `timeout_sec` 为止，中断了就把原因回到群里，不再重跑。
+
+**`stall_sec`（顶层，只对 sdk harness 生效）**：runner 每收到 SDK 的一条消息（模型输出、工具调用开始或结束）就往 stdout 写一行不带内容的进度行；连续 `stall_sec` 秒没有任何进度就判定这次运行卡死并停掉，回帖是 `Stalled`，会话保留。有了它，`timeout_sec` 可以放宽成总预算：正常在跑的长任务不会被总时长误杀，真卡住的又不用等满总时长。`stall_sec` 要大于单次工具调用可能的最长时间，`timeout_sec` 仍要小于 server 的 `lease_sec`。
+
+**`recovery`（按任务来源配置）**：键是 `trigger:<名字>`（某一个触发器）或 `trigger`（其余触发器）。有人 @ 的任务（`mention`）暂不支持，配了会在启动时报错；台账里每条记录已带来源字段，以后加不用改存储。
+
+```json
+"stall_sec": 900,
+"timeout_sec": 7200,
+"recovery": {
+  "trigger": {
+    "on": ["shutdown", "stall", "timeout", "error", "limit"],
+    "max_attempts": 2,
+    "retry_after_sec": 300,
+    "resume": true,
+    "quiet": true,
+    "notice_after_sec": 3600,
+    "give_up_after_sec": 86400
+  }
+}
+```
+
+| 字段 | 含义 |
+| --- | --- |
+| `on` | 哪些结束方式值得再跑：`shutdown`（worker 停了）、`stall`、`timeout`、`error`（harness 失败或以错误结束）、`limit`（用量上限）。不在列表里的照旧直接回帖 |
+| `max_attempts` | 一个任务总共最多跑几次，默认 2。因为上限根本没跑起来的那次不算 |
+| `retry_after_sec` | 下一次运行前等多久，默认 300。`shutdown` 在 worker 回来后立刻重跑，`limit` 等到上限重置 |
+| `resume` | 续接上一次留下的会话（prompt 用 `resume_prompt`，有默认值），而不是从头再来；会话续接不了就从头跑 |
+| `quiet` | 还会重跑的那次中断不往群里发任何东西，群里只看到最终结果。不开则每次中断都回帖，并写明几点自动重跑。harness 第一次撞上限的那一行说明两种情况下都照发 |
+| `notice_after_sec` | 任务有过中断、且到这个时长还没有最终结果时，发一行「还没有结果、下一次几点跑」；0 为不发 |
+| `give_up_after_sec` | 从任务第一次到达算起，超过就不再重跑，发一行放弃说明（带会话 id），默认 86400 |
+
+- 配了 `recovery` 的任务从被接受起就记在 worker 本机加密存储的台账里，直到有最终回帖才删，所以 worker 被强杀、断电也能在重启后接上。
+- 重跑不是在原任务上继续等：原任务先以空结果结束，到点后 worker 像触发器命令那样向 server 再排一个同 key 的任务，结果走平常的路径回群。这个任务 5 分钟内没回来（比如 server 重启丢了）会再排一次。
+- 没有 key 的触发任务不进台账，按原来的行为处理。同一个 key 在台账里只有一条：它还在排队或运行时，新来的同 key 任务被跳过；它在等重跑时，新来的同 key 任务直接当作这次重跑。
+- 最后一次仍然失败时，回帖是那次的失败原因，外加一行说明这是第几次运行。
 
 ## 部署
 
@@ -195,7 +234,7 @@ AGENTLINK_ENROLL_TOKEN=... agentlink-worker
 ## 开发
 
 ```bash
-go test -race ./...    # 加密、签名、多机器人路由、去重、重启不留消息、任务流水与统计、过期、会话生命周期、触发任务、用量上限与回退、端到端（测试二进制充当 SDK runner、mirasim 和 kimi）
+go test -race ./...    # 加密、签名、多机器人路由、去重、重启不留消息、任务流水与统计、过期、会话生命周期、触发任务、停滞检测与中断后续跑、用量上限与回退、端到端（测试二进制充当 SDK runner、mirasim 和 kimi）
 AGENTLINK_REAL_CLAUDE=1 go test -run TestRealSDK ./internal/worker   # 真 Agent SDK：新建会话 + resume，约 $0.02
 AGENTLINK_REAL_KIMI=1 go test -run TestRealKimi ./internal/worker     # 真 kimi：新建会话 + 续接 + 查额度，用一点 Kimi 额度
 ```

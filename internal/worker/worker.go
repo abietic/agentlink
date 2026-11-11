@@ -100,8 +100,9 @@ type Worker struct {
 	queues    map[string]*queue     // by queueKey
 	running   map[string]running    // by task id
 	locks     map[string]*sessionLock
-	marks     map[string]time.Time // trigger dedupe: "seen/<trigger>/<key>" and "ran/<trigger>/<key>"
-	limits    map[string]Limit     // by harness: the usage limit it last hit, until a run on it finishes without one
+	marks     map[string]time.Time   // trigger dedupe: "seen/<trigger>/<key>" and "ran/<trigger>/<key>"
+	limits    map[string]Limit       // by harness: the usage limit it last hit, until a run on it finishes without one
+	pending   map[string]*pendingRun // the recovery ledger, by pendingKey
 
 	runLogMu sync.Mutex
 }
@@ -123,11 +124,12 @@ func New(cfg Config) (*Worker, error) {
 		locks:   map[string]*sessionLock{},
 		marks:   map[string]time.Time{},
 		limits:  map[string]Limit{},
+		pending: map[string]*pendingRun{},
 		files:   attachmentClient,
 		fileOK:  tankaFile,
 	}
 	for name, h := range cfg.Harnesses {
-		w.runners[name] = h.runner(cfg.timeout())
+		w.runners[name] = h.runner(cfg.timeout(), cfg.stall())
 	}
 	if w.state, err = st.rooms(); err != nil {
 		return nil, err
@@ -136,6 +138,9 @@ func New(cfg Config) (*Worker, error) {
 		return nil, err
 	}
 	if _, err := st.get("limits", &w.limits); err != nil {
+		return nil, err
+	}
+	if _, err := st.get("pending", &w.pending); err != nil {
 		return nil, err
 	}
 	if err := pruneRunLog(w.runLogPath(), w.now()); err != nil {
@@ -194,6 +199,11 @@ func (w *Worker) Register(ctx context.Context) error {
 func (w *Worker) Run(ctx context.Context) error {
 	if len(w.cfg.AllowedUsers)+len(w.cfg.AllowedBots) == 0 {
 		log.Printf("allowed_users and allowed_bots are empty: every task is refused, and the reply shows the sender's id")
+	}
+	w.adopt()
+	if len(w.cfg.Recovery) > 0 {
+		w.wg.Add(1)
+		go w.recoverLoop(ctx)
 	}
 	for _, tr := range w.cfg.Triggers {
 		if len(tr.Command) > 0 {
@@ -262,7 +272,11 @@ func (w *Worker) status() proto.WorkerStatus {
 
 func (w *Worker) dispatch(ctx context.Context, t proto.Task) {
 	if t.Trigger != "" {
-		if err := w.admit(t); err != nil {
+		err := w.claimOrAdmit(t)
+		if err == errAnswered {
+			return
+		}
+		if err != nil {
 			log.Printf("task %s: trigger %s not run: %v", t.ID, t.Trigger, err)
 			go w.send(t, "") // posts nothing
 			return
@@ -283,6 +297,27 @@ func (w *Worker) dispatch(ctx context.Context, t proto.Task) {
 	if !w.enqueue(ctx, w.queueKey(t), t) {
 		go w.send(t, fmt.Sprintf("%d tasks are already waiting for this session on this device; try again later.", queueSize))
 	}
+}
+
+var errAnswered = errors.New("answered from the recovery ledger")
+
+// claimOrAdmit admits a triggered task, through the recovery ledger if its trigger has a
+// Recovery. errAnswered means the task carried a notice or a final reply the ledger was
+// waiting to post, and that it has been sent.
+func (w *Worker) claimOrAdmit(t proto.Task) error {
+	tr := w.trigger(t.Trigger)
+	if tr == nil || w.recovery(t.Trigger) == nil {
+		return w.admit(t)
+	}
+	reply, retry, ok, err := w.claim(t)
+	if err != nil {
+		return err
+	}
+	if !ok {
+		go w.send(t, reply)
+		return errAnswered
+	}
+	return w.admitTrigger(tr, t, retry)
 }
 
 // queueKey picks the queue t waits in. A triggered task starts its own session, so it waits
@@ -332,14 +367,18 @@ func (w *Worker) drain(ctx context.Context, key string, q *queue) {
 		}
 		t := q.tasks[0]
 		w.mu.Unlock()
-		reply := "The worker shut down before running this."
+		ran := false
+		reply := ""
 		if ctx.Err() == nil {
 			select {
 			case w.sem <- struct{}{}:
-				reply = w.handle(ctx, t)
+				reply, ran = w.handle(ctx, t), true
 				<-w.sem
 			case <-ctx.Done():
 			}
+		}
+		if !ran {
+			reply = w.unrun(t)
 		}
 		w.send(t, reply)
 		w.mu.Lock()
@@ -445,6 +484,9 @@ func parseCommand(text string) command {
 // handle runs a task that may change room state or start a run; it returns the reply.
 func (w *Worker) handle(ctx context.Context, t proto.Task) string {
 	if tr := w.trigger(t.Trigger); tr != nil { // the text is a prompt, never a room command
+		if pol := w.recovery(t.Trigger); pol != nil {
+			return w.triggered(ctx, t, tr, pol)
+		}
 		return w.prompt(ctx, t, Run{Harness: w.cfg.Harness, Workdir: tr.Workdir, Prompt: t.Text}, false)
 	}
 	if s, text, ok := w.addressed(t.RoomID, t.Text); ok {
@@ -554,13 +596,19 @@ func (w *Worker) resume(roomID, ref string) (string, bool) {
 // session it ends in becomes current. Otherwise the room's selection is left alone and the
 // session is only added to its history.
 func (w *Worker) prompt(ctx context.Context, t proto.Task, run Run, current bool) string {
+	reply, _ := w.run(ctx, t, run, current)
+	return reply
+}
+
+// run is prompt, and also says how the run ended.
+func (w *Worker) run(ctx context.Context, t proto.Task, run Run, current bool) (string, outcome) {
 	var skipped []string
 	if len(t.Attachments) > 0 {
 		run.Images, skipped = fetchImages(ctx, w.files, w.fileOK, t.Attachments)
 		log.Printf("task %s: passing on %d of %d attachments", t.ID, len(run.Images), len(t.Attachments))
 	}
 	if run.Prompt == "" && len(run.Images) == 0 {
-		return "Nothing to run: the message has no text, and its attachments were not passed on: " + strings.Join(skipped, ", ") + "."
+		return "Nothing to run: the message has no text, and its attachments were not passed on: " + strings.Join(skipped, ", ") + ".", outcome{}
 	}
 	if t.Trigger == "" {
 		run.UserID = t.UserID
@@ -582,10 +630,11 @@ func (w *Worker) prompt(ctx context.Context, t proto.Task, run Run, current bool
 		w.mu.Unlock()
 	}
 	if w.runners[run.Harness] == nil {
-		return fmt.Sprintf("This device has no harness `%s` any more; `harness` lists the ones it has.", run.Harness)
+		return fmt.Sprintf("This device has no harness `%s` any more; `harness` lists the ones it has.", run.Harness), outcome{}
 	}
 
 	var notes, resting []string // what to tell the room; harnesses at a limit
+	out := outcome{end: endLimit}
 	chain := w.chain(run.Harness)
 	for i, h := range chain {
 		r := run
@@ -603,6 +652,10 @@ func (w *Worker) prompt(ctx context.Context, t proto.Task, run Run, current bool
 			r.SessionID = newUUID()
 		}
 		res, err := w.attempt(ctx, t, r, current, text)
+		out.ran = true
+		if res.SessionID != "" || res.Stopped || r.Resume {
+			out.session, out.harness = cmp.Or(res.SessionID, r.SessionID), h
+		}
 		if res.Limit != nil && !res.Stopped {
 			if n := w.hitLimit(h, *res.Limit); n != "" {
 				notes = append(notes, n)
@@ -627,16 +680,36 @@ func (w *Worker) prompt(ctx context.Context, t proto.Task, run Run, current bool
 			}
 			notes = append(notes, fmt.Sprintf("%s`%s` took this over in a new session, without session `%s`'s history.", why, h, short(run.SessionID)))
 		}
-		return joinNotes(notes, w.format(ctx, t, r, res, err, skipped))
+		switch {
+		case res.Stopped && ctx.Err() != nil:
+			out.end = endShutdown
+		case res.Stalled:
+			out.end = endStall
+		case res.Stopped:
+			out.end = endTimeout
+		case err != nil || res.IsError:
+			out.end, out.noResult = endError, err != nil
+		default:
+			out.end = ""
+		}
+		return joinNotes(notes, w.format(ctx, t, r, res, err, skipped)), out
 	}
 	log.Printf("task %s: not run: %s", t.ID, strings.Join(resting, "; "))
+	w.mu.Lock()
+	for _, h := range chain {
+		if l, ok := w.limitedLocked(h); ok && (out.retryAt.IsZero() || l.ResetsAt.Before(out.retryAt)) {
+			out.retryAt = l.ResetsAt
+		}
+	}
+	w.mu.Unlock()
+	out.notice = strings.Join(notes, "\n\n")
 	if t.Trigger != "" {
 		if len(notes) == 0 {
-			return "" // the room was told when the limit was hit; posts nothing
+			return "", out // the room was told when the limit was hit; posts nothing
 		}
-		return joinNotes(notes, fmt.Sprintf("This `%s` task was not run.", t.Trigger))
+		return joinNotes(notes, fmt.Sprintf("This `%s` task was not run.", t.Trigger)), out
 	}
-	return joinNotes(notes, "Nothing ran: "+strings.Join(resting, "; ")+".")
+	return joinNotes(notes, "Nothing ran: "+strings.Join(resting, "; ")+"."), out
 }
 
 // chain is h and then its fallbacks, each once.
@@ -692,6 +765,8 @@ func (w *Worker) format(ctx context.Context, t proto.Task, run Run, res RunResul
 	switch {
 	case res.Stopped && ctx.Err() != nil:
 		b.WriteString("**Stopped:** the worker shut down during this run.")
+	case res.Stalled:
+		fmt.Fprintf(&b, "**Stalled:** nothing happened in this run for %s, so it was stopped. The session keeps what was done so far; send a follow-up to continue it.", w.cfg.stall())
 	case res.Stopped:
 		fmt.Fprintf(&b, "**Timed out** after %s. The session keeps what was done so far; send a follow-up to continue it.", w.cfg.timeout())
 	case err != nil:

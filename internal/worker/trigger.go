@@ -92,13 +92,21 @@ func (w *Worker) admit(t proto.Task) error {
 	if tr == nil {
 		return errors.New("no trigger named " + t.Trigger + " in this worker's config")
 	}
+	return w.admitTrigger(tr, t, false)
+}
+
+// admitTrigger is admit for a configured trigger; with retry the dedupe window is skipped.
+func (w *Worker) admitTrigger(tr *Trigger, t proto.Task, retry bool) error {
 	w.mu.Lock()
 	defer w.mu.Unlock()
 	mark := "ran/" + tr.Name + "/" + t.Key
-	if last, ok := w.marks[mark]; ok && t.Key != "" && w.now().Sub(last) < time.Duration(tr.DedupeSec)*time.Second {
+	if last, ok := w.marks[mark]; ok && !retry && t.Key != "" && w.now().Sub(last) < time.Duration(tr.DedupeSec)*time.Second {
 		return fmt.Errorf("key %s already ran at %s", t.Key, last.Local().Format("15:04"))
 	}
 	w.setMarkLocked(mark, w.now())
+	if w.recovery(tr.Name) != nil {
+		w.trackLocked(t)
+	}
 	return nil
 }
 
@@ -161,7 +169,7 @@ func (w *Worker) scan(ctx context.Context, tr Trigger) error {
 		if stale || (seen && !it.At.After(last)) {
 			continue
 		}
-		if err := w.submit(ctx, tr, it); err != nil {
+		if err := w.submit(ctx, tr.RoomID, tr.Name, it.Key, it.Text); err != nil {
 			return fmt.Errorf("queue %s: %w", it.Key, err)
 		}
 		log.Printf("trigger %s: queued %s", tr.Name, it.Key)
@@ -172,11 +180,12 @@ func (w *Worker) scan(ctx context.Context, tr Trigger) error {
 	return sc.Err()
 }
 
-func (w *Worker) submit(ctx context.Context, tr Trigger, it item) error {
-	plain, _ := json.Marshal(proto.TriggerBody{Trigger: tr.Name, Key: it.Key, Text: it.Text})
-	sealed, err := seal.Seal(w.key, w.serverKey, proto.TriggerContext(w.id.DeviceID, tr.RoomID), plain)
+// submit asks the server to queue a triggered task for roomID.
+func (w *Worker) submit(ctx context.Context, roomID, trigger, key, text string) error {
+	plain, _ := json.Marshal(proto.TriggerBody{Trigger: trigger, Key: key, Text: text})
+	sealed, err := seal.Seal(w.key, w.serverKey, proto.TriggerContext(w.id.DeviceID, roomID), plain)
 	if err != nil {
 		return err
 	}
-	return w.client.Trigger(ctx, proto.TriggerRequest{RoomID: tr.RoomID, Sealed: sealed})
+	return w.client.Trigger(ctx, proto.TriggerRequest{RoomID: roomID, Sealed: sealed})
 }

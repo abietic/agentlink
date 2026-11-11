@@ -39,10 +39,14 @@ type Config struct {
 	// SDKOptions go to the SDK's query() as options; cwd and the session are set per run.
 	// Default {"permissionMode": "auto"}: a model classifier approves or denies each tool
 	// call; a call it cannot decide is denied, since nobody is there to answer a prompt.
-	SDKOptions     json.RawMessage `json:"sdk_options"`
-	TimeoutSec     int             `json:"timeout_sec"`      // per run; default 1800, keep below the server's lease_sec
-	MaxConcurrency int             `json:"max_concurrency"`  // runs at once across rooms; default 2
-	MaxOutputChars int             `json:"max_output_chars"` // reply body cap; default 3500
+	SDKOptions json.RawMessage `json:"sdk_options"`
+	TimeoutSec int             `json:"timeout_sec"` // per run, in all; default 1800, keep below the server's lease_sec
+	// StallSec stops a run of an sdk harness once it has shown no activity for this long: no
+	// message from the model and no tool call starting or ending. 0, the default, leaves
+	// timeout_sec as the only bound. Keep it above the longest single tool call.
+	StallSec       int `json:"stall_sec"`
+	MaxConcurrency int `json:"max_concurrency"`  // runs at once across rooms; default 2
+	MaxOutputChars int `json:"max_output_chars"` // reply body cap; default 3500
 
 	// Harnesses are the ways this device can run a prompt, by name (see Harness). Harness
 	// is the default one, "claude" unless set; a room switches with `harness <name>`.
@@ -50,6 +54,8 @@ type Config struct {
 	Harness   string             `json:"harness"`
 
 	Triggers []Trigger `json:"triggers"` // see Trigger
+	// Recovery says, per task source, what happens when a run ends early; see Recovery.
+	Recovery map[string]Recovery `json:"recovery"`
 }
 
 func LoadConfig(path string) (Config, error) {
@@ -108,8 +114,16 @@ func (c *Config) applyDefaults() error {
 	if err := c.checkHarnesses(); err != nil {
 		return err
 	}
-	return c.checkTriggers()
+	if c.StallSec < 0 || c.StallSec >= c.TimeoutSec {
+		return errors.New("stall_sec must be 0 or below timeout_sec")
+	}
+	if err := c.checkTriggers(); err != nil {
+		return err
+	}
+	return c.checkRecovery()
 }
+
+func (c Config) stall() time.Duration { return time.Duration(c.StallSec) * time.Second }
 
 func (c Config) timeout() time.Duration { return time.Duration(c.TimeoutSec) * time.Second }
 

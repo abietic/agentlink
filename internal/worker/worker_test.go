@@ -46,6 +46,44 @@ func TestMain(m *testing.M) {
 		if req.Prompt == "sleep" {
 			time.Sleep(5 * time.Second)
 		}
+		progress := func() { json.NewEncoder(os.Stdout).Encode(runReply{Type: "progress", SessionID: req.SessionID}) }
+		fail := func(msg string) {
+			json.NewEncoder(os.Stdout).Encode(runReply{Type: "error", Error: msg, SessionID: req.SessionID})
+			os.Exit(1)
+		}
+		stall := func() {
+			progress()
+			time.Sleep(5 * time.Second)
+		}
+		switch req.Prompt {
+		case "stall":
+			stall()
+		case "busy": // slower than the stall window in all, but never silent for that long
+			for range 8 {
+				progress()
+				time.Sleep(200 * time.Millisecond)
+			}
+		}
+		// AGENTLINK_STUB_FAILS names a file like "error 2" or "stall 1": that many runs end
+		// that way. A line "noresume" makes every resumed run fail before it starts.
+		if path := os.Getenv("AGENTLINK_STUB_FAILS"); path != "" {
+			b, _ := os.ReadFile(path)
+			lines := strings.Split(strings.TrimSpace(string(b)), "\n")
+			if slices.Contains(lines, "noresume") && req.Resume {
+				json.NewEncoder(os.Stdout).Encode(runReply{Type: "error", Error: "no conversation found"})
+				os.Exit(1)
+			}
+			var mode string
+			var n int
+			if fmt.Sscanf(lines[0], "%s %d", &mode, &n); n > 0 {
+				lines[0] = fmt.Sprintf("%s %d", mode, n-1)
+				os.WriteFile(path, []byte(strings.Join(lines, "\n")), 0o600)
+				if mode == "stall" {
+					stall()
+				}
+				fail("boom")
+			}
+		}
 		for req.Prompt == "wait" {
 			if _, err := os.Stat(os.Getenv("AGENTLINK_STUB_GATE")); err == nil {
 				break
@@ -73,18 +111,31 @@ type fixture struct {
 
 func newFixture(t *testing.T) *fixture {
 	t.Helper()
+	f := newFixtureParallel(t)
+	t.Setenv("AGENTLINK_STUB_RUNNER", f.log)
+	f.cfg.Runner = []string{os.Args[0]}
+	f.cfg.Harnesses = nil
+	if err := f.cfg.applyDefaults(); err != nil {
+		t.Fatal(err)
+	}
+	return f
+}
+
+// newFixtureParallel is newFixture for parallel tests, which cannot set the environment:
+// the runner gets its log path through `env` instead.
+func newFixtureParallel(t *testing.T) *fixture {
+	t.Helper()
 	dir := t.TempDir()
 	root, _ := filepath.EvalSymlinks(dir)
 	root = filepath.Join(root, "code")
 	os.MkdirAll(filepath.Join(root, "sub"), 0o755)
 	log := filepath.Join(dir, "runs.log")
-	t.Setenv("AGENTLINK_STUB_RUNNER", log)
 	cfg := Config{
 		Name:         "test-laptop",
 		StateDir:     filepath.Join(dir, "state"),
 		AllowedUsers: []string{"U1"},
 		WorkdirRoots: []string{root},
-		Runner:       []string{os.Args[0]},
+		Runner:       []string{"env", "AGENTLINK_STUB_RUNNER=" + log, os.Args[0]},
 		TimeoutSec:   10,
 	}
 	if err := cfg.applyDefaults(); err != nil {
