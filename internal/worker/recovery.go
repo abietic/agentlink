@@ -40,8 +40,10 @@ type Recovery struct {
 	ResumePrompt string `json:"resume_prompt"`
 	// Quiet posts nothing for a run that will be retried, so the room sees only the final
 	// reply. Without it each early end is posted, with a line saying when the next run is.
-	// The one line a harness posts when it first reaches a usage limit is posted either way.
 	Quiet bool `json:"quiet"`
+	// AnnounceLimit keeps, under Quiet, the one line a harness posts when it first reaches a
+	// usage limit: which limit and when it resets. It is said once per limit.
+	AnnounceLimit bool `json:"announce_limit"`
 	// NoticeAfterSec posts one line once a task that had a run end early has gone this long
 	// without a final reply; 0 never does.
 	NoticeAfterSec int `json:"notice_after_sec"`
@@ -288,7 +290,10 @@ func (w *Worker) triggered(ctx context.Context, t proto.Task, tr *Trigger, pol *
 	w.savePendingLocked()
 	log.Printf("task %s: run %d of %s %s %s; next run at %s", t.ID, e.Attempts, t.Trigger, t.Key, endText[out.end], e.Next.Format(time.RFC3339))
 	if pol.Quiet {
-		return out.notice // a harness reaching a limit is news about the device, not this task's failure
+		if pol.AnnounceLimit {
+			return out.notice
+		}
+		return ""
 	}
 	return joinNotes([]string{reply}, fmt.Sprintf("↻ It runs again on its own at %s (run %d of at most %d).", e.Next.Local().Format("15:04"), e.Attempts+1, pol.MaxAttempts))
 }

@@ -431,7 +431,17 @@ func TestLedgerNoticeOnlyAfterARunEndedEarly(t *testing.T) {
 func TestLimitWaitsForTheResetWithoutUsingARun(t *testing.T) {
 	limit := filepath.Join(t.TempDir(), "limit.json")
 	t.Setenv("AGENTLINK_STUB_LIMIT", limit)
-	w, _, now := ledgerWorker(t, Recovery{On: []string{"limit"}, Quiet: true})
+	// Quiet alone says nothing about the limit either.
+	wq, _, _ := ledgerWorker(t, Recovery{On: []string{"limit"}, Quiet: true})
+	os.WriteFile(limit, []byte(`{"type":"five_hour","resets_at":4102444800}`), 0o600)
+	first := proto.Task{ID: "t0", RoomID: "R1", Trigger: "alerts", Key: "a", Text: "triage a"}
+	if err := wq.claimOrAdmit(first); err != nil {
+		t.Fatal(err)
+	}
+	if reply := wq.handle(context.Background(), first); reply != "" || wq.pending["alerts/a"] == nil {
+		t.Fatalf("quiet reply at a limit: %q %+v", reply, wq.pending)
+	}
+	w, _, now := ledgerWorker(t, Recovery{On: []string{"limit"}, Quiet: true, AnnounceLimit: true})
 	reset := now.Add(3 * time.Hour).Truncate(time.Second)
 	os.WriteFile(limit, []byte(fmt.Sprintf(`{"type":"five_hour","resets_at":%d}`, reset.Unix())), 0o600)
 	ctx := context.Background()

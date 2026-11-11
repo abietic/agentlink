@@ -126,6 +126,7 @@ mirasim 的几点限制：
     "retry_after_sec": 300,
     "resume": true,
     "quiet": true,
+    "announce_limit": true,
     "notice_after_sec": 3600,
     "give_up_after_sec": 86400
   }
@@ -138,7 +139,8 @@ mirasim 的几点限制：
 | `max_attempts` | 一个任务总共最多跑几次，默认 2。因为上限根本没跑起来的那次不算 |
 | `retry_after_sec` | 下一次运行前等多久，默认 300。`shutdown` 在 worker 回来后立刻重跑，`limit` 等到上限重置 |
 | `resume` | 续接上一次留下的会话（prompt 用 `resume_prompt`，有默认值），而不是从头再来；会话续接不了就从头跑 |
-| `quiet` | 还会重跑的那次中断不往群里发任何东西，群里只看到最终结果。不开则每次中断都回帖，并写明几点自动重跑。harness 第一次撞上限的那一行说明两种情况下都照发 |
+| `quiet` | 还会重跑的那次中断不往群里发任何东西，群里只看到最终结果。不开则每次中断都回帖，并写明几点自动重跑。|
+| `announce_limit` | `quiet` 打开时，harness 第一次撞上限的那一行说明（哪个上限、几点重置，每轮上限只说一次）是否照发；默认不发 |
 | `notice_after_sec` | 任务有过中断、且到这个时长还没有最终结果时，发一行「还没有结果、下一次几点跑」；0 为不发 |
 | `give_up_after_sec` | 从任务第一次到达算起，超过就不再重跑，发一行放弃说明（带会话 id），默认 86400 |
 

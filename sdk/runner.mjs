@@ -22,7 +22,7 @@ else options.sessionId = req.session_id; // a new session under the id the worke
 
 const print = (o) => process.stdout.write(JSON.stringify(o) + '\n');
 let sessionId = req.session_id;
-let result;
+const results = []; // one per turn: a background task that ends after the answer starts another turn
 let limitInfo; // the latest rate_limit_event's rate_limit_info
 let rateLimit; // set when the run stopped at a usage limit
 let prompt = req.prompt;
@@ -46,23 +46,26 @@ try {
       const info = limitInfo?.status === 'rejected' ? limitInfo : undefined;
       rateLimit = { type: info?.rateLimitType ?? '', resets_at: info?.resetsAt ?? 0 };
     }
-    if (m.type === 'result') result = m;
+    if (m.type === 'result') results.push(m);
   }
 } catch (e) {
   print({ type: 'error', error: abortController.signal.aborted ? 'aborted' : String(e?.message ?? e), session_id: sessionId, rate_limit: rateLimit });
   process.exit(1);
 }
+const result = results.at(-1);
 if (!result) {
   print({ type: 'error', error: 'the SDK returned no result', session_id: sessionId, rate_limit: rateLimit });
   process.exit(1);
 }
 const ok = result.subtype === 'success';
+// The answer is usually the first turn's text; what later turns add goes below it.
+const earlier = results.slice(0, -1).filter((r) => r.subtype === 'success' && r.result).map((r) => r.result);
 print({
   type: 'result',
-  text: ok ? result.result : (result.errors ?? []).join('\n') || result.subtype,
+  text: [...earlier, ok ? result.result : (result.errors ?? []).join('\n') || result.subtype].join('\n\n'),
   session_id: result.session_id,
   is_error: result.is_error || !ok,
-  num_turns: result.num_turns,
+  num_turns: results.reduce((n, r) => n + (r.num_turns ?? 0), 0),
   total_cost_usd: result.total_cost_usd,
   denials: result.permission_denials?.length ?? 0,
   rate_limit: rateLimit,
