@@ -127,6 +127,7 @@ mirasim 的几点限制：
     "resume": true,
     "quiet": true,
     "announce_limit": true,
+    "auth": true,
     "notice_after_sec": 3600,
     "give_up_after_sec": 86400
   }
@@ -135,12 +136,13 @@ mirasim 的几点限制：
 
 | 字段 | 含义 |
 | --- | --- |
-| `on` | 哪些结束方式值得再跑：`shutdown`（worker 停了）、`stall`、`timeout`、`error`（harness 失败或以错误结束）、`limit`（用量上限）。不在列表里的照旧直接回帖 |
+| `on` | 哪些结束方式值得再跑：`shutdown`（worker 停了）、`stall`、`timeout`、`error`（harness 失败或以错误结束）、`limit`（用量上限）。不在列表里的照旧直接回帖。登录失败不写在这里，见 `auth` |
 | `max_attempts` | 一个任务总共最多跑几次，默认 2。因为上限根本没跑起来的那次不算 |
 | `retry_after_sec` | 下一次运行前等多久，默认 300。`shutdown` 在 worker 回来后立刻重跑，`limit` 等到上限重置 |
 | `resume` | 续接上一次留下的会话（prompt 用 `resume_prompt`，有默认值），而不是从头再来；会话续接不了就从头跑 |
 | `quiet` | 还会重跑的那次中断不往群里发任何东西，群里只看到最终结果。不开则每次中断都回帖，并写明几点自动重跑。|
-| `announce_limit` | `quiet` 打开时，harness 第一次撞上限的那一行说明（哪个上限、几点重置，每轮上限只说一次）是否照发；默认不发 |
+| `announce_limit` | `quiet` 打开时，harness 第一次撞上限的那一行说明（哪个上限、几点重置，每轮上限只说一次）和第一次登录失败的那一行说明是否照发；默认不发 |
+| `auth` | harness 登录失败（登录过期或被吊销、token 无效，见下）时等它恢复：这次不算进 `max_attempts`，续接中的会话保留、下次照样续接，每隔 `retry_after_sec` 重跑直到 `give_up_after_sec`，然后发平常的放弃说明。默认 `true`；`false` 时按 `error` 处理（旧行为） |
 | `notice_after_sec` | 任务有过中断、且到这个时长还没有最终结果时，发一行「还没有结果、下一次几点跑」；0 为不发 |
 | `give_up_after_sec` | 从任务第一次到达算起，超过就不再重跑，发一行放弃说明（带会话 id），默认 86400 |
 
@@ -148,6 +150,8 @@ mirasim 的几点限制：
 - 重跑不是在原任务上继续等：原任务先以空结果结束，到点后 worker 像触发器命令那样向 server 再排一个同 key 的任务，结果走平常的路径回群。这个任务 5 分钟内没回来（比如 server 重启丢了）会再排一次。
 - 没有 key 的触发任务不进台账，按原来的行为处理。同一个 key 在台账里只有一条：它还在排队或运行时，新来的同 key 任务被跳过；它在等重跑时，新来的同 key 任务直接当作这次重跑。
 - 最后一次仍然失败时，回帖是那次的失败原因，外加一行说明这是第几次运行。
+- 登录失败的判定集中在一处（`endOf`）：runner 报 `auth_failed`（SDK 的 `authentication_failed`），或失败的运行里出现 `Not logged in · Please run /login`、`Invalid API key`、`OAuth access token is invalid` / `OAuth token has expired`、`API Error: 401`、`authentication_error` 之一。只看失败的运行，正常答案里提到 401 不算。停滞、超时、worker 停止优先于登录失败。
+- 登录失败的说明按 harness 只发一次（`quiet` 下要 `announce_limit` 才发），之后的重跑不再发；这个 harness 上有一次运行正常结束后才会重新计。worker 重启后会再说一次。
 
 ## 部署
 
@@ -236,7 +240,7 @@ AGENTLINK_ENROLL_TOKEN=... agentlink-worker
 ## 开发
 
 ```bash
-go test -race ./...    # 加密、签名、多机器人路由、去重、重启不留消息、任务流水与统计、过期、会话生命周期、触发任务、停滞检测与中断后续跑、用量上限与回退、端到端（测试二进制充当 SDK runner、mirasim 和 kimi）
+go test -race ./...    # 加密、签名、多机器人路由、去重、重启不留消息、任务流水与统计、过期、会话生命周期、触发任务、停滞检测与中断后续跑、登录失败等待、用量上限与回退、端到端（测试二进制充当 SDK runner、mirasim 和 kimi）
 AGENTLINK_REAL_CLAUDE=1 go test -run TestRealSDK ./internal/worker   # 真 Agent SDK：新建会话 + resume，约 $0.02
 AGENTLINK_REAL_KIMI=1 go test -run TestRealKimi ./internal/worker     # 真 kimi：新建会话 + 续接 + 查额度，用一点 Kimi 额度
 ```

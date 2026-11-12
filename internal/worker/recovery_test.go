@@ -3,6 +3,7 @@ package worker
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
@@ -494,5 +495,179 @@ func TestShutdownBeforeRunning(t *testing.T) {
 	}
 	if r := w.unrun(proto.Task{ID: "t2", RoomID: "R1", UserID: "U1", Text: "hi"}); !strings.Contains(r, "shut down before running") {
 		t.Fatalf("a mention: %q", r)
+	}
+}
+
+func TestEndOfTellsASignInFailureApart(t *testing.T) {
+	live, stopped := context.Background(), func() context.Context {
+		ctx, cancel := context.WithCancel(context.Background())
+		cancel()
+		return ctx
+	}()
+	notLoggedIn := errors.New("Not logged in · Please run /login")
+	for _, tc := range []struct {
+		name string
+		ctx  context.Context
+		res  RunResult
+		err  error
+		want string
+	}{
+		{"finished", live, RunResult{Text: "the fix returns 401 for an invalid API key"}, nil, ""},
+		{"runner flag", live, RunResult{IsError: true, AuthFailed: true}, nil, endAuth},
+		{"runner flag on an error line", live, RunResult{AuthFailed: true}, errors.New("the SDK returned no result"), endAuth},
+		{"not logged in result", live, RunResult{IsError: true, Text: "Not logged in · Please run /login"}, nil, endAuth},
+		{"not logged in error", live, RunResult{}, notLoggedIn, endAuth},
+		{"expired token", live, RunResult{}, errors.New(`API Error: 401 {"type":"error","error":{"type":"authentication_error","message":"OAuth token has expired"}}`), endAuth},
+		{"invalid token", live, RunResult{IsError: true, Text: "Failed to authenticate. OAuth access token is invalid"}, nil, endAuth},
+		{"sdk error kind", live, RunResult{}, errors.New("assistant error: authentication_failed"), endAuth},
+		{"invalid api key", live, RunResult{IsError: true, Text: "Invalid API key · Please run /login"}, nil, endAuth},
+		{"other error", live, RunResult{IsError: true, Text: "error_max_turns"}, nil, endError},
+		{"runner crashed", live, RunResult{}, errors.New("boom"), endError},
+		{"401 in a failed run about something else", live, RunResult{IsError: true, Text: "the upstream answered 401"}, nil, endError},
+		{"stall wins", live, RunResult{Stopped: true, Stalled: true, AuthFailed: true}, notLoggedIn, endStall},
+		{"timeout wins", live, RunResult{Stopped: true}, notLoggedIn, endTimeout},
+		{"shutdown wins", stopped, RunResult{Stopped: true, AuthFailed: true}, notLoggedIn, endShutdown},
+	} {
+		if got := endOf(tc.ctx, tc.res, tc.err); got != tc.want {
+			t.Errorf("%s: endOf = %q, want %q", tc.name, got, tc.want)
+		}
+	}
+}
+
+func TestRecoveryAuthConfig(t *testing.T) {
+	f := newFixture(t)
+	c := f.cfg
+	c.Recovery = map[string]Recovery{"trigger": {On: []string{"error", "auth"}}}
+	if err := c.checkRecovery(); err == nil || !strings.Contains(err.Error(), `unknown "auth"`) {
+		t.Fatalf("auth in on: %v", err)
+	}
+	var r Recovery
+	if json.Unmarshal([]byte(`{"on":["error"]}`), &r); !r.waitsOnAuth() || !r.retries(endAuth) || r.retries(endStall) {
+		t.Fatal("auth is on by default, whatever on lists")
+	}
+	if json.Unmarshal([]byte(`{"on":["error"],"auth":false}`), &r); r.waitsOnAuth() || r.retries(endAuth) {
+		t.Fatal(`"auth": false`)
+	}
+}
+
+func TestSignInFailureKeepsTheSessionAndUsesNoRun(t *testing.T) {
+	// Two runs in all: the first fails, and only a run that could sign in counts after it.
+	e := newRecoveryE2E(t, Recovery{On: []string{"error"}, MaxAttempts: 2, RetryAfterSec: 1, Resume: true, Quiet: true, AnnounceLimit: true, ResumePrompt: "go on"}, alertA)
+	os.WriteFile(e.fails, []byte("error 1\nauth 1\nauthflag 1"), 0o600)
+	stop := e.start()
+	// Under quiet the room is told about the sign-in once, then sees the answer.
+	if p := e.next(t); !strings.HasPrefix(p, "🔑 `claude` could not sign in") || !strings.Contains(p, "every 1s") {
+		t.Fatalf("first post %q", p)
+	}
+	if p := e.next(t); !strings.HasPrefix(p, "echo: go on @ ") {
+		t.Fatalf("second post %q", p)
+	}
+	e.settled(t, stop)
+	// Every retry resumed the first run's session; none started over.
+	rs := e.requests(t)
+	if len(rs) != 4 || rs[0].Resume {
+		t.Fatalf("runs: %+v", rs)
+	}
+	for _, r := range rs[1:] {
+		if !r.Resume || r.SessionID != rs[0].SessionID || r.Prompt != "go on" {
+			t.Fatalf("runs: %+v", rs)
+		}
+	}
+	if e.w.authDown["claude"] {
+		t.Fatal("a run that finished did not clear the sign-in failure")
+	}
+}
+
+func TestSignInFailureNotQuietPostsOnce(t *testing.T) {
+	e := newRecoveryE2E(t, Recovery{On: []string{"error"}, MaxAttempts: 1, RetryAfterSec: 1}, alertA)
+	os.WriteFile(e.fails, []byte("auth 3"), 0o600)
+	stop := e.start()
+	if p := e.next(t); !strings.Contains(p, "OAuth access token is invalid") || !strings.Contains(p, "🔑 `claude` could not sign in") || strings.Contains(p, "↻") {
+		t.Fatalf("first post %q", p)
+	}
+	// The next two runs fail the same way and post nothing; the fourth answers.
+	if p := e.next(t); !strings.HasPrefix(p, "echo: triage a @ ") {
+		t.Fatalf("second post %q", p)
+	}
+	e.settled(t, stop)
+	if rs := e.requests(t); len(rs) != 4 {
+		t.Fatalf("runs: %+v", rs)
+	}
+}
+
+func TestSignInFailureAsAnErrorWhenAuthIsOff(t *testing.T) {
+	off := false
+	e := newRecoveryE2E(t, Recovery{On: []string{"error"}, Auth: &off, MaxAttempts: 2, RetryAfterSec: 1, Resume: true, Quiet: true}, alertA)
+	os.WriteFile(e.fails, []byte("error 1\nauth 9"), 0o600)
+	stop := e.start()
+	if p := e.next(t); !strings.Contains(p, "OAuth access token is invalid") || !strings.Contains(p, "This was run 2 of this task") || strings.Contains(p, "🔑") {
+		t.Fatalf("posted %q", p)
+	}
+	e.settled(t, stop)
+	// As before: the resume that failed without a result starts over.
+	if rs := e.requests(t); len(rs) != 3 || !rs[1].Resume || rs[2].Resume {
+		t.Fatalf("runs: %+v", rs)
+	}
+}
+
+func TestSignInFailureGivesUpAfterTheWindow(t *testing.T) {
+	fails := filepath.Join(t.TempDir(), "fails")
+	t.Setenv("AGENTLINK_STUB_FAILS", fails)
+	os.WriteFile(fails, []byte("authflag 99"), 0o600)
+	ctx := context.Background()
+	task := proto.Task{ID: "t1", RoomID: "R1", Trigger: "alerts", Key: "a", Text: "triage a"}
+	// Quiet without announce_limit says nothing about it.
+	wq, _, _ := ledgerWorker(t, Recovery{Quiet: true})
+	if err := wq.claimOrAdmit(task); err != nil {
+		t.Fatal(err)
+	}
+	if reply := wq.handle(ctx, task); reply != "" || wq.pending["alerts/a"] == nil {
+		t.Fatalf("quiet reply: %q %+v", reply, wq.pending)
+	}
+	w, asked, now := ledgerWorker(t, Recovery{RetryAfterSec: 300, GiveUpAfterSec: 3600})
+	run := func(task proto.Task) string {
+		t.Helper()
+		if _, retry, ok, err := w.claim(task); !ok || err != nil {
+			t.Fatalf("claim: %v", err)
+		} else if err := w.admitTrigger(w.trigger("alerts"), task, retry); err != nil {
+			t.Fatal(err)
+		}
+		return w.handle(ctx, task)
+	}
+	// Nothing is in on: the sign-in failure is retried on its own key.
+	if reply := run(task); !strings.Contains(reply, "stub: no sign-in") || !strings.Contains(reply, "🔑 `claude` could not sign in") {
+		t.Fatalf("first reply %q", reply)
+	}
+	e := w.pending["alerts/a"]
+	if e == nil || e.State != "waiting" || e.Why != endAuth || e.Attempts != 0 || !e.Next.Equal(now.Add(5*time.Minute)) {
+		t.Fatalf("entry: %+v", e)
+	}
+	*now = now.Add(5 * time.Minute)
+	w.recoverOnce(ctx)
+	if reply := run(task); reply != "" || e.Attempts != 0 || e.State != "waiting" || e.Why != endAuth {
+		t.Fatalf("second reply %q, entry %+v", reply, e)
+	}
+	// Past give_up_after_sec the final reply is asked for instead of another run.
+	*now = now.Add(time.Hour)
+	before := asked.Load()
+	w.recoverOnce(ctx)
+	if asked.Load() != before+1 || e.State != "sent" || e.Want != "final" {
+		t.Fatalf("entry: %+v", e)
+	}
+	reply, _, ok, err := w.claim(task)
+	if ok || err != nil || !strings.HasPrefix(reply, "**Gave up** on `alerts` task `a`: its harness could not sign in") {
+		t.Fatalf("final: %q ok=%v err=%v", reply, ok, err)
+	}
+	if len(w.pending) != 0 {
+		t.Fatalf("ledger: %+v", w.pending)
+	}
+	// A run that fails to sign in after the window is the final reply itself.
+	b := proto.Task{ID: "t2", RoomID: "R1", Trigger: "alerts", Key: "b", Text: "triage b"}
+	if reply := run(b); reply != "" {
+		t.Fatalf("b, first run: %q", reply) // the sign-in failure was already announced
+	}
+	*now = now.Add(2 * time.Hour)
+	if reply := run(b); !strings.Contains(reply, "stub: no sign-in") || !strings.Contains(reply, "could not sign in until the retries ran out") || len(w.pending) != 0 {
+		t.Fatalf("b, past the window: %q %+v", reply, w.pending)
 	}
 }

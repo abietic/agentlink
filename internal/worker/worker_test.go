@@ -64,8 +64,10 @@ func TestMain(m *testing.M) {
 				time.Sleep(200 * time.Millisecond)
 			}
 		}
-		// AGENTLINK_STUB_FAILS names a file like "error 2" or "stall 1": that many runs end
-		// that way. A line "noresume" makes every resumed run fail before it starts.
+		// AGENTLINK_STUB_FAILS names a file of lines like "error 2" or "stall 1": the first
+		// line with runs left says how the next run ends, and counts down. "auth" fails the
+		// way an old runner reports a lost sign-in; "authflag" only sets runner.mjs's flag.
+		// A line "noresume" makes every resumed run fail before it starts.
 		if path := os.Getenv("AGENTLINK_STUB_FAILS"); path != "" {
 			b, _ := os.ReadFile(path)
 			lines := strings.Split(strings.TrimSpace(string(b)), "\n")
@@ -73,13 +75,22 @@ func TestMain(m *testing.M) {
 				json.NewEncoder(os.Stdout).Encode(runReply{Type: "error", Error: "no conversation found"})
 				os.Exit(1)
 			}
-			var mode string
-			var n int
-			if fmt.Sscanf(lines[0], "%s %d", &mode, &n); n > 0 {
-				lines[0] = fmt.Sprintf("%s %d", mode, n-1)
+			for i, line := range lines {
+				var mode string
+				var n int
+				if fmt.Sscanf(line, "%s %d", &mode, &n); n <= 0 {
+					continue
+				}
+				lines[i] = fmt.Sprintf("%s %d", mode, n-1)
 				os.WriteFile(path, []byte(strings.Join(lines, "\n")), 0o600)
-				if mode == "stall" {
+				switch mode {
+				case "stall":
 					stall()
+				case "auth":
+					fail("Failed to authenticate. API Error: 401 OAuth access token is invalid")
+				case "authflag":
+					json.NewEncoder(os.Stdout).Encode(runReply{Type: "result", Text: "stub: no sign-in", SessionID: req.SessionID, IsError: true, AuthFailed: true})
+					os.Exit(0)
 				}
 				fail("boom")
 			}

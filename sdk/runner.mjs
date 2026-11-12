@@ -5,7 +5,8 @@
 // stdout: JSON lines. {"type":"progress", "session_id"} at the start and for every message the
 //         SDK yields (no content: the worker only watches that the run is alive), then one last
 //         line, {"type":"result", ...} or {"type":"error", "error", "session_id"}; either
-//         carries "rate_limit": {"type", "resets_at"} when the run stopped at a usage limit
+//         carries "rate_limit": {"type", "resets_at"} when the run stopped at a usage limit, and
+//         "auth_failed": true when the SDK could not sign in (expired or revoked login or token)
 // SIGTERM aborts the query; the session keeps what was done so far.
 import { query } from '@anthropic-ai/claude-agent-sdk';
 
@@ -25,6 +26,7 @@ let sessionId = req.session_id;
 const results = []; // one per turn: a background task that ends after the answer starts another turn
 let limitInfo; // the latest rate_limit_event's rate_limit_info
 let rateLimit; // set when the run stopped at a usage limit
+let authFailed; // set when the SDK could not sign in
 let prompt = req.prompt;
 if (req.images?.length) {
   const content = req.images.map((i) => ({ type: 'image', source: { type: 'base64', media_type: i.media_type, data: i.data } }));
@@ -46,15 +48,16 @@ try {
       const info = limitInfo?.status === 'rejected' ? limitInfo : undefined;
       rateLimit = { type: info?.rateLimitType ?? '', resets_at: info?.resetsAt ?? 0 };
     }
+    if (m.type === 'assistant' && m.error === 'authentication_failed') authFailed = true;
     if (m.type === 'result') results.push(m);
   }
 } catch (e) {
-  print({ type: 'error', error: abortController.signal.aborted ? 'aborted' : String(e?.message ?? e), session_id: sessionId, rate_limit: rateLimit });
+  print({ type: 'error', error: abortController.signal.aborted ? 'aborted' : String(e?.message ?? e), session_id: sessionId, rate_limit: rateLimit, auth_failed: authFailed });
   process.exit(1);
 }
 const result = results.at(-1);
 if (!result) {
-  print({ type: 'error', error: 'the SDK returned no result', session_id: sessionId, rate_limit: rateLimit });
+  print({ type: 'error', error: 'the SDK returned no result', session_id: sessionId, rate_limit: rateLimit, auth_failed: authFailed });
   process.exit(1);
 }
 const ok = result.subtype === 'success';
@@ -69,4 +72,5 @@ print({
   total_cost_usd: result.total_cost_usd,
   denials: result.permission_denials?.length ?? 0,
   rate_limit: rateLimit,
+  auth_failed: authFailed,
 });

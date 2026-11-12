@@ -103,6 +103,7 @@ type Worker struct {
 	marks     map[string]time.Time   // trigger dedupe: "seen/<trigger>/<key>" and "ran/<trigger>/<key>"
 	limits    map[string]Limit       // by harness: the usage limit it last hit, until a run on it finishes without one
 	pending   map[string]*pendingRun // the recovery ledger, by pendingKey
+	authDown  map[string]bool        // by harness: a retried run on it could not sign in and the room was told, until a run on it finishes
 
 	runLogMu sync.Mutex
 }
@@ -113,20 +114,21 @@ func New(cfg Config) (*Worker, error) {
 		return nil, err
 	}
 	w := &Worker{
-		cfg:     cfg,
-		client:  NewClient(cfg.ServerURL),
-		runners: map[string]Runner{},
-		store:   st,
-		sem:     make(chan struct{}, cfg.MaxConcurrency),
-		now:     time.Now,
-		queues:  map[string]*queue{},
-		running: map[string]running{},
-		locks:   map[string]*sessionLock{},
-		marks:   map[string]time.Time{},
-		limits:  map[string]Limit{},
-		pending: map[string]*pendingRun{},
-		files:   attachmentClient,
-		fileOK:  tankaFile,
+		cfg:      cfg,
+		client:   NewClient(cfg.ServerURL),
+		runners:  map[string]Runner{},
+		store:    st,
+		sem:      make(chan struct{}, cfg.MaxConcurrency),
+		now:      time.Now,
+		queues:   map[string]*queue{},
+		running:  map[string]running{},
+		locks:    map[string]*sessionLock{},
+		marks:    map[string]time.Time{},
+		limits:   map[string]Limit{},
+		pending:  map[string]*pendingRun{},
+		authDown: map[string]bool{},
+		files:    attachmentClient,
+		fileOK:   tankaFile,
 	}
 	for name, h := range cfg.Harnesses {
 		w.runners[name] = h.runner(cfg.timeout(), cfg.stall())
@@ -670,8 +672,14 @@ func (w *Worker) run(ctx context.Context, t proto.Task, run Run, current bool) (
 			notes = append(notes, fmt.Sprintf("⚠️ `%s` could not run: %v", h, err))
 			continue
 		}
+		end := endOf(ctx, res, err)
 		if err == nil {
 			w.clearLimit(h)
+		}
+		if end != endAuth && err == nil {
+			w.mu.Lock()
+			delete(w.authDown, h)
+			w.mu.Unlock()
 		}
 		if h != run.Harness && run.Resume {
 			why := ""
@@ -680,17 +688,9 @@ func (w *Worker) run(ctx context.Context, t proto.Task, run Run, current bool) (
 			}
 			notes = append(notes, fmt.Sprintf("%s`%s` took this over in a new session, without session `%s`'s history.", why, h, short(run.SessionID)))
 		}
-		switch {
-		case res.Stopped && ctx.Err() != nil:
-			out.end = endShutdown
-		case res.Stalled:
-			out.end = endStall
-		case res.Stopped:
-			out.end = endTimeout
-		case err != nil || res.IsError:
-			out.end, out.noResult = endError, err != nil
-		default:
-			out.end = ""
+		out.end, out.noResult = end, (end == endError || end == endAuth) && err != nil
+		if end == endAuth {
+			out.harness = h
 		}
 		return joinNotes(notes, w.format(ctx, t, r, res, err, skipped)), out
 	}
@@ -750,7 +750,7 @@ func (w *Worker) attempt(ctx context.Context, t proto.Task, run Run, current boo
 		w.saveLocked(t.RoomID)
 	}
 	w.mu.Unlock()
-	log.Printf("task %s: finished in %s (error=%v, limit=%v)", t.ID, res.Duration.Round(time.Second), err != nil || res.IsError, res.Limit != nil)
+	log.Printf("task %s: finished in %s (error=%v, limit=%v, auth=%v)", t.ID, res.Duration.Round(time.Second), err != nil || res.IsError, res.Limit != nil, authFailed(res, err))
 	rec := runRecord{Event: "run", Task: t.ID, Trigger: t.Trigger, Harness: run.Harness, Session: cmp.Or(res.SessionID, run.SessionID),
 		Seconds: res.Duration.Seconds(), Failed: err != nil || res.IsError, Stopped: res.Stopped, Turns: res.Turns, CostUSD: res.CostUSD}
 	if res.Limit != nil {

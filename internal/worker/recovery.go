@@ -28,6 +28,11 @@ type Recovery struct {
 	// out), "error" (the harness failed or ended with an error) and "limit" (a usage limit;
 	// the next run waits until it resets).
 	On []string `json:"on"`
+	// Auth waits out a harness that cannot sign in (an expired or revoked login or token):
+	// such a run does not count against MaxAttempts, keeps the session it was resuming, and
+	// the task runs again every RetryAfterSec until GiveUpAfterSec. The room is told once,
+	// when the harness first fails this way. Default true; false treats it as "error".
+	Auth *bool `json:"auth,omitempty"`
 	// MaxAttempts is how many runs a task gets in all; default 2. A run that never started
 	// because of a usage limit does not count.
 	MaxAttempts int `json:"max_attempts"`
@@ -42,7 +47,8 @@ type Recovery struct {
 	// reply. Without it each early end is posted, with a line saying when the next run is.
 	Quiet bool `json:"quiet"`
 	// AnnounceLimit keeps, under Quiet, the one line a harness posts when it first reaches a
-	// usage limit: which limit and when it resets. It is said once per limit.
+	// usage limit (which limit and when it resets, once per limit), and the one line saying
+	// it could not sign in (once until a run on it finishes again).
 	AnnounceLimit bool `json:"announce_limit"`
 	// NoticeAfterSec posts one line once a task that had a run end early has gone this long
 	// without a final reply; 0 never does.
@@ -57,6 +63,7 @@ const (
 	endTimeout  = "timeout"
 	endError    = "error"
 	endLimit    = "limit"
+	endAuth     = "auth"
 
 	defaultResumePrompt = "Your previous run on this task was interrupted before it finished. Continue from where it stopped, without repeating work that is already done, and end with the complete answer to the original task."
 )
@@ -67,6 +74,69 @@ var endText = map[string]string{
 	endTimeout:  "ran out of time",
 	endError:    "ended with an error",
 	endLimit:    "hit a usage limit",
+	endAuth:     "could not sign in to its harness",
+}
+
+// endOf is how a harness run ended: "" if it finished, else one of the end* kinds. A run the
+// context stopped is a shutdown even if it also printed something.
+func endOf(ctx context.Context, res RunResult, err error) string {
+	switch {
+	case res.Stopped && ctx.Err() != nil:
+		return endShutdown
+	case res.Stalled:
+		return endStall
+	case res.Stopped:
+		return endTimeout
+	case authFailed(res, err):
+		return endAuth
+	case err != nil || res.IsError:
+		return endError
+	}
+	return ""
+}
+
+// authSigns are what a failed run says when the harness could not sign in: the CLI's
+// "Not logged in · Please run /login" and "Invalid API key · Please run /login", and the API's
+// 401 for an expired, revoked or invalid OAuth token.
+var authSigns = []string{
+	"please run /login",
+	"not logged in",
+	"authentication_failed",
+	"authentication_error",
+	"oauth access token is invalid",
+	"oauth token has expired",
+	"oauth token revoked",
+	"invalid api key",
+	"api error: 401",
+}
+
+// authFailed reports whether a failed run failed to sign in. The runner says so itself
+// (res.AuthFailed); the texts cover runners from before it did, and other harnesses. Only a
+// failed run is read, so an answer that is about a 401 is not taken for one.
+func authFailed(res RunResult, err error) bool {
+	if res.AuthFailed {
+		return true
+	}
+	if err == nil && !res.IsError {
+		return false
+	}
+	text := res.Text
+	if err != nil {
+		text += "\n" + err.Error()
+	}
+	text = strings.ToLower(text)
+	return slices.ContainsFunc(authSigns, func(s string) bool { return strings.Contains(text, s) })
+}
+
+// waitsOnAuth: see Recovery.Auth.
+func (r *Recovery) waitsOnAuth() bool { return r.Auth == nil || *r.Auth }
+
+// retries reports whether a run that ended with end runs again under r.
+func (r *Recovery) retries(end string) bool {
+	if end == endAuth && r.waitsOnAuth() {
+		return true
+	}
+	return slices.Contains(r.On, end)
 }
 
 // How often the ledger is checked, and how long a retry the server was asked for may take
@@ -88,8 +158,8 @@ func (c *Config) checkRecovery() error {
 			return fmt.Errorf("recovery %q: no trigger has that name", src)
 		}
 		for _, k := range r.On {
-			if _, ok := endText[k]; !ok {
-				return fmt.Errorf("recovery %q: on: unknown %q; use shutdown, stall, timeout, error, limit", src, k)
+			if _, ok := endText[k]; !ok || k == endAuth {
+				return fmt.Errorf("recovery %q: on: unknown %q; use shutdown, stall, timeout, error, limit (sign-in failures have their own key, \"auth\")", src, k)
 			}
 		}
 		r.MaxAttempts = defaultInt(r.MaxAttempts, 2)
@@ -208,6 +278,13 @@ func (w *Worker) noticeLocked(e *pendingRun) string {
 }
 
 func finalText(e *pendingRun) string {
+	if e.Why == endAuth {
+		s := fmt.Sprintf("**Gave up** on `%s` task `%s`: its harness could not sign in until the retries ran out (give_up_after_sec), after %d counted run(s). Sign the harness in again on this device.", e.Trigger, e.Key, e.Attempts)
+		if e.Session != "" {
+			s += fmt.Sprintf("\n\nsession `%s` (to follow up, @ me and start with `%s`)", short(e.Session), short(e.Session))
+		}
+		return s
+	}
 	s := fmt.Sprintf("**Gave up** on `%s` task `%s` after %d run(s): the last one %s.", e.Trigger, e.Key, e.Attempts, cmp.Or(endText[e.Why], "did not finish"))
 	if e.Session != "" {
 		s += fmt.Sprintf("\n\nsession `%s` (to follow up, @ me and start with `%s`)", short(e.Session), short(e.Session))
@@ -256,24 +333,31 @@ func (w *Worker) triggered(ctx context.Context, t proto.Task, tr *Trigger, pol *
 	w.mu.Unlock()
 
 	reply, out := w.run(ctx, t, run, false)
-	if run.Resume && out.noResult {
+	if out.end == endAuth && !pol.waitsOnAuth() {
+		out.end = endError
+	}
+	auth := out.end == endAuth
+	// A run that could not sign in says nothing about the session: it is resumed next time.
+	if run.Resume && out.noResult && !auth {
 		log.Printf("task %s: session %s could not be continued; starting over", t.ID, short(run.SessionID))
 		reply, out = w.run(ctx, t, fresh, false)
 	}
 
 	w.mu.Lock()
 	defer w.mu.Unlock()
-	if out.ran || out.end != endLimit {
+	if (out.ran || out.end != endLimit) && !auth {
 		e.Attempts++
 	}
 	if out.session != "" {
 		e.Session, e.Harness = out.session, out.harness
 	}
 	age := w.now().Sub(e.First)
-	if out.end == "" || !slices.Contains(pol.On, out.end) || e.Attempts >= pol.MaxAttempts || age >= time.Duration(pol.GiveUpAfterSec)*time.Second {
+	if out.end == "" || !pol.retries(out.end) || e.Attempts >= pol.MaxAttempts || age >= time.Duration(pol.GiveUpAfterSec)*time.Second {
 		delete(w.pending, k)
 		w.savePendingLocked()
-		if out.end != "" && e.Attempts > 1 {
+		if auth {
+			reply += "\n\n⚠️ The harness could not sign in until the retries ran out (give_up_after_sec); no more runs follow on their own. Sign it in again on this device."
+		} else if out.end != "" && e.Attempts > 1 {
 			reply += fmt.Sprintf("\n\n⚠️ This was run %d of this task; no more follow on their own.", e.Attempts)
 		}
 		return reply
@@ -289,6 +373,22 @@ func (w *Worker) triggered(ctx context.Context, t proto.Task, tr *Trigger, pol *
 	}
 	w.savePendingLocked()
 	log.Printf("task %s: run %d of %s %s %s; next run at %s", t.ID, e.Attempts, t.Trigger, t.Key, endText[out.end], e.Next.Format(time.RFC3339))
+	if auth {
+		// Said once per harness until a run on it finishes again, not once per retry.
+		if w.authDown[out.harness] {
+			return ""
+		}
+		w.authDown[out.harness] = true
+		notice := fmt.Sprintf("🔑 `%s` could not sign in on this device. Its triggered tasks wait and run again every %s until their give_up_after_sec (this one next at %s); these runs do not count against max_attempts. Said only this once.",
+			out.harness, time.Duration(pol.RetryAfterSec)*time.Second, e.Next.Local().Format("15:04"))
+		switch {
+		case !pol.Quiet:
+			return joinNotes([]string{reply}, notice)
+		case pol.AnnounceLimit:
+			return notice
+		}
+		return ""
+	}
 	if pol.Quiet {
 		if pol.AnnounceLimit {
 			return out.notice
