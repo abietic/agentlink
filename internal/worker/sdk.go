@@ -26,16 +26,17 @@ type Run struct {
 }
 
 type RunResult struct {
-	Text      string
-	SessionID string
-	IsError   bool
-	Stopped   bool // timed out, stalled, or the worker shut down
-	Stalled   bool // stopped because the harness showed no activity for its stall window
-	Turns     int
-	Denials   int
-	CostUSD   float64
-	Duration  time.Duration
-	Limit     *Limit // the run stopped at this usage limit
+	Text       string
+	SessionID  string
+	IsError    bool
+	Stopped    bool // timed out, stalled, or the worker shut down
+	Stalled    bool // stopped because the harness showed no activity for its stall window
+	Turns      int
+	Denials    int
+	CostUSD    float64
+	Duration   time.Duration
+	Limit      *Limit // the run stopped at this usage limit
+	AuthFailed bool   // the harness could not sign in (the runner says so)
 }
 
 type Runner interface {
@@ -63,6 +64,7 @@ type runReply struct {
 	NumTurns     int     `json:"num_turns"`
 	TotalCostUSD float64 `json:"total_cost_usd"`
 	Denials      int     `json:"denials"`
+	AuthFailed   bool    `json:"auth_failed"`
 	RateLimit    *struct {
 		Type     string `json:"type"`
 		ResetsAt int64  `json:"resets_at"` // epoch seconds; 0 if unknown
@@ -148,7 +150,7 @@ func (c SDK) Run(ctx context.Context, r Run) (RunResult, error) {
 
 	var out runReply
 	if json.Unmarshal(lastLine(stdout.buf.Bytes()), &out) == nil {
-		res.SessionID = out.SessionID
+		res.SessionID, res.AuthFailed = out.SessionID, out.AuthFailed
 		if l := out.RateLimit; l != nil {
 			res.Limit = &Limit{Name: l.Type}
 			if l.ResetsAt > 0 {
