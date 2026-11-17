@@ -106,6 +106,7 @@ mirasim 的几点限制：
 - 触发任务不检查 `allowed_users`，文本不当群命令解析；在该 trigger 的 `workdir` 新开会话。这个会话记进群的会话历史，但不成为当前会话：回帖页脚写着会话 id，群里的人 @ 机器人、以这个 id 开头就能接着追问，每条告警各自一条线，互不串话。
 - 排队：群自己的命令和当前会话的 prompt 排一队；指名某个会话的消息只跟同一会话排队；每个触发任务单独一队。不同队列并行，总数受 `max_concurrency` 限制；同一个会话无论从哪个队列来，同一时刻只跑一个。
 - 结果没有 `response_url`，只能发到群的 incoming webhook，所以该群必须配 `room_webhooks`。空结果不发；排队超时的触发任务静默丢弃。
+- 回帖底色：`triggers[].themes` 是「标签 → Tanka theme」表，例如 `{"【需处理】": "important", "【跟进中】": "idea"}`。回帖里第一行以某个标签开头（忽略行首的 `**` / `_`）的，整条消息用对应的 theme；同一行匹配多个标签取最长的，都不匹配就是白底。theme 只能是 `idea`（黄）、`important`（红）、`celebration`（绿）、`announcement`（蓝），写错启动时报错。标签由触发任务自己的提示词约定，worker 不认识具体业务。
 - server 的 `rooms`（群 id → device id）在启动时写入绑定，触发用的群不必有人去发 `pair`。
 
 ### 停滞检测与中断后续跑

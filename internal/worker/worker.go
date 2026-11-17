@@ -423,7 +423,11 @@ func (w *Worker) send(t proto.Task, text string) {
 func (w *Worker) post(t proto.Task, text string) {
 	rec := runRecord{Event: "result", Task: t.ID, Trigger: t.Trigger, Bytes: len(text)}
 	defer func() { w.logRun(rec) }()
-	plain, _ := json.Marshal(proto.Result{Text: text})
+	res := proto.Result{Text: text}
+	if tr := w.trigger(t.Trigger); tr != nil {
+		res.Theme = theme(tr.Themes, text)
+	}
+	plain, _ := json.Marshal(res)
 	sealed, err := seal.Seal(w.key, w.serverKey, proto.ResultContext(w.id.DeviceID, t.ID), plain)
 	if err != nil {
 		log.Printf("task %s: seal result: %v", t.ID, err)

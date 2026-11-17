@@ -89,7 +89,12 @@ type Attachment struct {
 type Message struct {
 	Text     string `json:"text"`
 	TextType string `json:"text_type,omitempty"`
+	Theme    string `json:"theme,omitempty"` // one of Themes; Tanka ignores other values
 }
+
+// Themes are the message background colors Tanka accepts: idea is yellow, important red,
+// celebration green and announcement blue. No theme is a plain white message.
+var Themes = []string{"idea", "important", "celebration", "announcement"}
 
 // Post sends m to a response_url or an incoming-webhook URL. Both URLs carry a secret
 // token, so errors never include the URL.

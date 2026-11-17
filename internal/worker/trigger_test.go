@@ -28,6 +28,8 @@ func TestTriggerConfig(t *testing.T) {
 		{[]Trigger{{Name: "a"}, {Name: "a"}}, "unique"},
 		{[]Trigger{{Name: "a", Command: []string{"true"}}}, "room_id is required"},
 		{[]Trigger{{Name: "a", Workdir: "/"}}, "outside the allowed workdir roots"},
+		{[]Trigger{{Name: "a", Themes: map[string]string{"x": "red"}}}, "theme one of"},
+		{[]Trigger{{Name: "a", Themes: map[string]string{"": "idea"}}}, "label must be set"},
 	} {
 		c := f.cfg
 		c.Triggers = tc.trs
@@ -42,6 +44,23 @@ func TestTriggerConfig(t *testing.T) {
 	}
 	if tr := c.Triggers[0]; tr.Workdir != f.root || tr.EverySec != 60 || tr.DedupeSec != 1800 || tr.MaxAgeSec != 3600 || strings.HasPrefix(tr.Command[0], "~") {
 		t.Fatalf("defaults: %+v", tr)
+	}
+}
+
+func TestTheme(t *testing.T) {
+	themes := map[string]string{"【需处理】": "important", "Run": "announcement", "Run failed": "idea"}
+	for text, want := range map[string]string{
+		"**【需处理】x**\n- a":             "important",
+		"⚠️ note\n\n**【需处理】x**":       "important", // a note before the reply
+		"**【无需处理】x**":                 "",
+		"Run failed: boom":            "idea", // longest label wins
+		"plain\n【需处理】 not at the top": "important",
+		"nothing here":                "",
+		"":                            "",
+	} {
+		if got := theme(themes, text); got != want {
+			t.Errorf("theme(%q) = %q, want %q", text, got, want)
+		}
 	}
 }
 
@@ -122,7 +141,7 @@ func TestTriggerCommandEndToEnd(t *testing.T) {
 	fake := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		var m tanka.Message
 		json.NewDecoder(r.Body).Decode(&m)
-		posts <- r.URL.Path + " " + m.Text
+		posts <- r.URL.Path + " [" + m.Theme + "] " + m.Text
 		fmt.Fprint(w, `{"code":0}`)
 	}))
 	defer fake.Close()
@@ -165,7 +184,8 @@ func TestTriggerCommandEndToEnd(t *testing.T) {
 	now := time.Now()
 	writeItems(item{Key: "old", At: now.Add(-2 * time.Hour), Text: "old news"}, item{Key: "a", At: now.Add(-time.Minute), Text: "triage a"})
 	f.cfg.ServerURL, f.cfg.EnrollToken = hs.URL, "enroll"
-	f.cfg.Triggers = []Trigger{{Name: "alerts", RoomID: "R1", Workdir: filepath.Join(f.root, "sub"), Command: []string{"cat", items}}}
+	f.cfg.Triggers = []Trigger{{Name: "alerts", RoomID: "R1", Workdir: filepath.Join(f.root, "sub"), Command: []string{"cat", items},
+		Themes: map[string]string{"echo: old": "important"}}}
 	if err := f.cfg.checkTriggers(); err != nil {
 		t.Fatal(err)
 	}
@@ -188,7 +208,7 @@ func TestTriggerCommandEndToEnd(t *testing.T) {
 
 	done := make(chan error, 1)
 	go func() { done <- w.Run(ctx) }() // the watcher scans once at start
-	if p := next(); !strings.HasPrefix(p, "/room echo: triage a @ "+filepath.Join(f.root, "sub")) {
+	if p := next(); !strings.HasPrefix(p, "/room [] echo: triage a @ "+filepath.Join(f.root, "sub")) {
 		t.Fatalf("first scan posted %q", p)
 	}
 
@@ -197,7 +217,7 @@ func TestTriggerCommandEndToEnd(t *testing.T) {
 	if err := w.scan(ctx, w.cfg.Triggers[0]); err != nil {
 		t.Fatal(err)
 	}
-	if p := next(); !strings.HasPrefix(p, "/room echo: old again") {
+	if p := next(); !strings.HasPrefix(p, "/room [important] echo: old again") {
 		t.Fatalf("second scan posted %q", p)
 	}
 	cancel()

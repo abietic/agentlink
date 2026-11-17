@@ -62,7 +62,8 @@ type Attachment struct {
 // Result is the worker's reply to a task, posted to the task's room as markdown.
 // An empty Text posts nothing.
 type Result struct {
-	Text string `json:"text"`
+	Text  string `json:"text"`
+	Theme string `json:"theme,omitempty"` // Tanka message theme, see tanka.Themes
 }
 
 // TriggerRequest asks the server to queue a triggered task for the device paired with

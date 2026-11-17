@@ -10,10 +10,13 @@ import (
 	"fmt"
 	"log"
 	"os/exec"
+	"slices"
+	"strings"
 	"time"
 
 	"agentlink/internal/proto"
 	"agentlink/internal/seal"
+	"agentlink/internal/tanka"
 )
 
 // Trigger lets tasks start without anyone typing. Tasks named after it come from the server
@@ -31,6 +34,9 @@ type Trigger struct {
 	EverySec  int      `json:"every_sec"`   // default 60
 	DedupeSec int      `json:"dedupe_sec"`  // a key that ran within this long is skipped; default 1800
 	MaxAgeSec int      `json:"max_age_sec"` // items older than this at first sight are skipped; default 3600
+	// Themes colors a reply by its content: the first line that starts with one of these
+	// labels (ignoring leading markdown emphasis) gets that Tanka theme. Longest label wins.
+	Themes map[string]string `json:"themes"`
 }
 
 // item is one line of a trigger command's output.
@@ -65,6 +71,11 @@ func (c *Config) checkTriggers() error {
 		tr.EverySec = defaultInt(tr.EverySec, 60)
 		tr.DedupeSec = defaultInt(tr.DedupeSec, 1800)
 		tr.MaxAgeSec = defaultInt(tr.MaxAgeSec, 3600)
+		for label, theme := range tr.Themes {
+			if label == "" || !slices.Contains(tanka.Themes, theme) {
+				return fmt.Errorf("trigger %s: themes[%q] = %q: label must be set and theme one of %v", tr.Name, label, theme, tanka.Themes)
+			}
+		}
 	}
 	return nil
 }
@@ -74,6 +85,24 @@ func defaultInt(v, def int) int {
 		return def
 	}
 	return v
+}
+
+// theme is the Tanka theme for a reply: the first line that starts with a label in
+// themes picks it, the longest matching label winning; no match means no theme.
+func theme(themes map[string]string, text string) string {
+	for line := range strings.Lines(text) {
+		line = strings.TrimLeft(line, "*_ \t")
+		best := ""
+		for label := range themes {
+			if strings.HasPrefix(line, label) && len(label) > len(best) {
+				best = label
+			}
+		}
+		if best != "" {
+			return themes[best]
+		}
+	}
+	return ""
 }
 
 func (w *Worker) trigger(name string) *Trigger {

@@ -795,7 +795,7 @@ func (s *Server) handleResult(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
 		return
 	}
-	if err := s.reply(s.bots[rt.Bot], rt.Room, rt.URL, res.Text); err != nil {
+	if err := s.reply(s.bots[rt.Bot], rt.Room, rt.URL, res.Text, res.Theme); err != nil {
 		log.Printf("task %s: reply failed: %v", id, err)
 		s.logDone(id, outReplyFailed, len(env.Sealed))
 		http.Error(w, "reply failed", http.StatusBadGateway)
@@ -852,7 +852,7 @@ func (s *Server) reapExpired(now time.Time) {
 
 func (s *Server) replyAsync(bot *Bot, roomID, responseURL, text string) {
 	go func() {
-		if err := s.reply(bot, roomID, responseURL, text); err != nil {
+		if err := s.reply(bot, roomID, responseURL, text, ""); err != nil {
 			log.Printf("reply bot=%s room=%s failed: %v", bot.Name, roomID, err)
 		}
 	}()
@@ -860,11 +860,11 @@ func (s *Server) replyAsync(bot *Bot, roomID, responseURL, text string) {
 
 // reply posts to the event's response_url (single use, threads under the mention) and
 // falls back to the room's incoming webhook.
-func (s *Server) reply(bot *Bot, roomID, responseURL, text string) error {
+func (s *Server) reply(bot *Bot, roomID, responseURL, text, theme string) error {
 	if bot == nil {
 		return errors.New("the task's bot is no longer configured")
 	}
-	msg := tanka.Message{Text: tanka.Truncate(text, s.cfg.MaxReplyChars), TextType: "markdown"}
+	msg := tanka.Message{Text: tanka.Truncate(text, s.cfg.MaxReplyChars), TextType: "markdown", Theme: theme}
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 	var errs []error
