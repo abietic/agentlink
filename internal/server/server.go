@@ -9,9 +9,11 @@
 // server's storage key, and comes back with the result; once a device has a task, the server
 // keeps only what it needs to say the task was dropped, and a restart loses nothing but tasks
 // still waiting. SQLite holds devices, room bindings, the server's key, and metadata: a log
-// of what became of each task (ids, times, sizes, outcome; kept 90 days) and what each worker
-// last reported about itself. Neither the database nor the logs hold message text or where a
-// reply goes.
+// of what became of each task (ids, times, sizes, outcome; kept 90 days), what each worker
+// last reported about itself, and, to route a mention that quotes a message (see quote.go),
+// which session each reply came from and when it was posted, and which session each person's
+// mention ran in, by message id (kept 90 days). Neither the database nor the logs hold message
+// text or where a reply goes.
 package server
 
 import (
@@ -91,6 +93,24 @@ CREATE TABLE IF NOT EXISTS task_log (
 	outcome TEXT                   -- NULL while waiting or running
 );
 CREATE INDEX IF NOT EXISTS task_log_queued_at ON task_log (queued_at);
+-- Each reply posted to a room, and the session it came from; see quote.go.
+CREATE TABLE IF NOT EXISTS posts (
+	bot TEXT NOT NULL,
+	room_id TEXT NOT NULL,
+	session_id TEXT NOT NULL,      -- "" for the server's own notices
+	post_start INTEGER NOT NULL,   -- unix ms, before the post was sent
+	post_end INTEGER NOT NULL      -- unix ms, once Tanka took it
+);
+CREATE INDEX IF NOT EXISTS posts_room_end ON posts (room_id, post_end);
+-- The session each person's mention ran in, by the mention's Tanka message id; see quote.go.
+CREATE TABLE IF NOT EXISTS mentions (
+	message_id TEXT PRIMARY KEY,
+	bot TEXT NOT NULL,
+	room_id TEXT NOT NULL,
+	session_id TEXT NOT NULL,
+	at INTEGER NOT NULL            -- unix ms
+);
+CREATE INDEX IF NOT EXISTS mentions_at ON mentions (at);
 CREATE TABLE IF NOT EXISTS device_stats (
 	device_id TEXT PRIMARY KEY,
 	status TEXT NOT NULL DEFAULT '',        -- the worker's last proto.WorkerStatus, JSON
@@ -149,6 +169,7 @@ type task struct {
 	id, dev, bot, room string
 	sealed             []byte // proto.Task sealed to the device; nil once taken
 	reply              string // response_url; empty for triggered tasks
+	msg                string // the message id of a person's mention; empty otherwise
 	created            time.Time
 	until              time.Time // lease end; zero while waiting
 }
@@ -160,7 +181,8 @@ type replyTo struct {
 	Bot   string `json:"bot"`
 	Room  string `json:"room"`
 	URL   string `json:"url"`
-	Until int64  `json:"until"` // lease end, unix ms: a later result is refused
+	Until int64  `json:"until"`         // lease end, unix ms: a later result is refused
+	Msg   string `json:"msg,omitempty"` // task.msg
 }
 
 func New(cfg Config) (*Server, error) {
@@ -500,14 +522,21 @@ func (s *Server) enqueue(bot *Bot, ev tanka.MentionEvent, text string) {
 		// Not queued: a prompt that runs hours later, when the laptop wakes up, would surprise.
 		msg = fmt.Sprintf("Device `%s` is offline (last seen %s), so nothing was queued.", d.ID, s.ago(d.LastSeen))
 	default:
-		t := proto.Task{RoomID: ev.RoomID, RoomName: ev.RoomName, UserID: ev.UserID, UserName: ev.UserName, Text: text, SenderType: ev.SenderType}
+		t := proto.Task{RoomID: ev.RoomID, RoomName: ev.RoomName, UserID: ev.UserID, UserName: ev.UserName, Text: text, SenderType: ev.SenderType, ReplyMessageID: ev.ReplyMessageID()}
 		for _, a := range ev.Attachments {
 			t.Attachments = append(t.Attachments, proto.Attachment{URL: a.URL, Name: a.Name})
 		}
-		id, err := s.insertTask(bot, d, t, ev.UserID, ev.ResponseURL)
+		if t.ReplyMessageID != "" {
+			t.RouteSessionID = s.quotedSession(bot.Name, ev.RoomID, t.ReplyMessageID)
+		}
+		mentionID := ev.MessageID
+		if ev.SenderType == "bot" {
+			mentionID = "" // only a person's mention is kept as a message a quote can be routed by
+		}
+		id, err := s.insertTask(bot, d, t, ev.UserID, ev.ResponseURL, mentionID)
 		switch {
 		case err == nil:
-			log.Printf("task %s queued bot=%s room=%s user=%s device=%s attachments=%d", id, bot.Name, ev.RoomID, ev.UserID, d.ID, len(t.Attachments))
+			log.Printf("task %s queued bot=%s room=%s user=%s device=%s attachments=%d quoted=%v", id, bot.Name, ev.RoomID, ev.UserID, d.ID, len(t.Attachments), t.ReplyMessageID != "")
 			return
 		case errors.Is(err, errQueueFull):
 			msg = fmt.Sprintf("Device `%s` already has %d tasks waiting; try again later.", d.ID, maxQueuePerDev)
@@ -522,9 +551,9 @@ func (s *Server) enqueue(bot *Bot, ev tanka.MentionEvent, text string) {
 var errQueueFull = fmt.Errorf("already has %d tasks waiting or running", maxQueuePerDev)
 
 // insertTask fills in t's id and time, seals it to d and queues it in memory; responseURL
-// may be empty. sender is who asked for it, for the task log. It refuses once d has
-// maxQueuePerDev tasks waiting or running.
-func (s *Server) insertTask(bot *Bot, d *device, t proto.Task, sender, responseURL string) (string, error) {
+// may be empty, and so may msg, the message id of a person's mention. sender is who asked
+// for it, for the task log. It refuses once d has maxQueuePerDev tasks waiting or running.
+func (s *Server) insertTask(bot *Bot, d *device, t proto.Task, sender, responseURL, msg string) (string, error) {
 	id := "t-" + randHex(6)
 	t.ID, t.CreatedAt = id, s.now()
 	plain, err := json.Marshal(t)
@@ -546,7 +575,7 @@ func (s *Server) insertTask(bot *Bot, d *device, t proto.Task, sender, responseU
 		s.mu.Unlock()
 		return "", errQueueFull
 	}
-	s.waiting[d.ID] = append(s.waiting[d.ID], &task{id: id, dev: d.ID, bot: bot.Name, room: t.RoomID, sealed: sealed, reply: responseURL, created: s.now()})
+	s.waiting[d.ID] = append(s.waiting[d.ID], &task{id: id, dev: d.ID, bot: bot.Name, room: t.RoomID, sealed: sealed, reply: responseURL, msg: msg, created: s.now()})
 	s.logQueued(id, bot.Name, d.ID, t, sender, len(sealed), n+1) // under mu, so a lease cannot log first
 	s.mu.Unlock()
 	s.signal(d.ID)
@@ -564,7 +593,7 @@ func (s *Server) trigger(bot *Bot, roomID, name, key, text, from string) (string
 	if err != nil {
 		return "", err
 	}
-	id, err := s.insertTask(bot, d, proto.Task{RoomID: roomID, Text: text, Trigger: name, Key: key}, from, "")
+	id, err := s.insertTask(bot, d, proto.Task{RoomID: roomID, Text: text, Trigger: name, Key: key}, from, "", "")
 	if err != nil {
 		return "", fmt.Errorf("device %s: %w", d.ID, err)
 	}
@@ -728,7 +757,7 @@ func (s *Server) lease(dev string) (*proto.Envelope, error) {
 	s.leased[t.id] = t
 	s.mu.Unlock()
 	s.logLeased(t.id, t.until)
-	plain, _ := json.Marshal(replyTo{Dev: t.dev, Bot: t.bot, Room: t.room, URL: t.reply, Until: t.until.UnixMilli()})
+	plain, _ := json.Marshal(replyTo{Dev: t.dev, Bot: t.bot, Room: t.room, URL: t.reply, Until: t.until.UnixMilli(), Msg: t.msg})
 	boxed, err := seal.Box(s.key, "reply "+t.id, plain)
 	if err != nil {
 		return nil, err
@@ -751,7 +780,7 @@ func (s *Server) taken(dev, id string, boxed []byte) *replyTo {
 	s.mu.Unlock()
 	var rt replyTo
 	if t != nil {
-		rt = replyTo{Dev: t.dev, Bot: t.bot, Room: t.room, URL: t.reply, Until: t.until.UnixMilli()}
+		rt = replyTo{Dev: t.dev, Bot: t.bot, Room: t.room, URL: t.reply, Until: t.until.UnixMilli(), Msg: t.msg}
 	} else if plain, err := seal.Unbox(s.key, "reply "+id, boxed); err != nil || json.Unmarshal(plain, &rt) != nil || rt.Dev != dev {
 		return nil
 	}
@@ -789,13 +818,16 @@ func (s *Server) handleResult(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "unknown task", http.StatusNotFound)
 		return
 	}
+	if rt.Msg != "" && res.SessionID != "" {
+		s.logMention(rt.Msg, rt.Bot, rt.Room, res.SessionID)
+	}
 	if res.Text == "" {
 		log.Printf("task %s done room=%s (nothing to post)", id, rt.Room)
 		s.logDone(id, outEmpty, len(env.Sealed))
 		writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
 		return
 	}
-	if err := s.reply(s.bots[rt.Bot], rt.Room, rt.URL, res.Text, res.Theme); err != nil {
+	if err := s.reply(s.bots[rt.Bot], rt.Room, rt.URL, res.Text, res.Theme, res.SessionID); err != nil {
 		log.Printf("task %s: reply failed: %v", id, err)
 		s.logDone(id, outReplyFailed, len(env.Sealed))
 		http.Error(w, "reply failed", http.StatusBadGateway)
@@ -852,18 +884,20 @@ func (s *Server) reapExpired(now time.Time) {
 
 func (s *Server) replyAsync(bot *Bot, roomID, responseURL, text string) {
 	go func() {
-		if err := s.reply(bot, roomID, responseURL, text, ""); err != nil {
+		if err := s.reply(bot, roomID, responseURL, text, "", ""); err != nil {
 			log.Printf("reply bot=%s room=%s failed: %v", bot.Name, roomID, err)
 		}
 	}()
 }
 
 // reply posts to the event's response_url (single use, threads under the mention) and
-// falls back to the room's incoming webhook.
-func (s *Server) reply(bot *Bot, roomID, responseURL, text, theme string) error {
+// falls back to the room's incoming webhook. Once posted, it records the post with session,
+// the session the text came from ("" for the server's own notices).
+func (s *Server) reply(bot *Bot, roomID, responseURL, text, theme, session string) error {
 	if bot == nil {
 		return errors.New("the task's bot is no longer configured")
 	}
+	start := s.now()
 	msg := tanka.Message{Text: tanka.Truncate(text, s.cfg.MaxReplyChars), TextType: "markdown", Theme: theme}
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
@@ -875,6 +909,7 @@ func (s *Server) reply(bot *Bot, roomID, responseURL, text, theme string) error 
 	default:
 		err := tanka.Post(ctx, s.http, responseURL, msg)
 		if err == nil {
+			s.logPost(bot.Name, roomID, session, start, s.now())
 			return nil
 		}
 		errs = append(errs, fmt.Errorf("response_url: %w", err))
@@ -886,6 +921,7 @@ func (s *Server) reply(bot *Bot, roomID, responseURL, text, theme string) error 
 	if err := tanka.Post(ctx, s.http, hook, msg); err != nil {
 		return errors.Join(append(errs, fmt.Errorf("room webhook: %w", err))...)
 	}
+	s.logPost(bot.Name, roomID, session, start, s.now())
 	return nil
 }
 

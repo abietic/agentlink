@@ -496,6 +496,33 @@ func TestImageOnlyMention(t *testing.T) {
 	}
 }
 
+// TestQuotedMentionCarriesReplyID: event.message.reply_message_id reaches the task; events
+// without it, or from before Tanka sent event.message, give an empty one.
+func TestQuotedMentionCarriesReplyID(t *testing.T) {
+	_, base, ft := newTestServer(t, nil)
+	dev := register(t, base, "")
+	sendEvent(t, base, mention(ft, "R1", "U1", "@Agent Link pair "+dev.DeviceID))
+	ft.next(t)
+	dev.poll(t) // online
+
+	for i, tc := range []struct{ message, want string }{
+		{`,"message":{"message_id":"m9","msg_type":1,"text":"@Agent Link 这个要处理吗","reply_message_id":"m1"}`, "m1"},
+		{`,"message":{"message_id":"m9","msg_type":1,"text":"@Agent Link 这个要处理吗"}`, ""},
+		{``, ""}, // the shape before 2026-11-19
+	} {
+		body := []byte(fmt.Sprintf(`{"type":"event_callback","event_id":"ev-quote-%d","authorizations":[{"subject_type":"bot","member_id":"B1"}],
+			"event":{"type":"app_mention","user_id":"U1","room_id":"R1","message_id":"m9","text":"@Agent Link 这个要处理吗",
+			"response_url":"%s/hooks/response/tok","attachments":[]%s}}`, i, ft.URL, tc.message))
+		if resp := signedPost(t, base+"/tanka/events", secret, body, time.Now()); resp.StatusCode != http.StatusOK {
+			t.Fatalf("case %d: HTTP %d", i, resp.StatusCode)
+		}
+		task := dev.poll(t)
+		if task == nil || task.Text != "这个要处理吗" || task.ReplyMessageID != tc.want {
+			t.Fatalf("case %d: task = %+v", i, task)
+		}
+	}
+}
+
 // botMention is a mention a bot or a webhook sent, as Tanka has delivered them since 2026-11-05.
 func botMention(ft *fakeTanka, room, user, text string) tanka.Envelope {
 	ev := mention(ft, room, user, text)

@@ -68,6 +68,11 @@ func (c *Config) checkHarnesses() error {
 			if h.SDKOptions == nil {
 				h.SDKOptions = c.SDKOptions
 			}
+			opts, err := withHandoffRule(h.SDKOptions)
+			if err != nil {
+				return fmt.Errorf("harness %q: %w", name, err)
+			}
+			h.SDKOptions = opts
 			if len(h.Runner) == 0 {
 				return fmt.Errorf(`harness %q: runner is required, e.g. ["node", "/path/to/agentlink/sdk/runner.mjs"]`, name)
 			}

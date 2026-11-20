@@ -31,9 +31,10 @@ import (
 )
 
 const (
-	maxSessions  = 50 // remembered per room: alerts open sessions often, and people come back to them
-	listSessions = 15 // shown by `sessions`
-	queueSize    = 16 // waiting tasks per queue
+	maxSessions   = 50 // remembered per room: alerts open sessions often, and people come back to them
+	listSessions  = 15 // shown by `sessions`
+	otherSessions = 5  // listed for a hand-off, see handoff.go
+	queueSize     = 16 // waiting tasks per queue
 )
 
 type Session struct {
@@ -104,6 +105,8 @@ type Worker struct {
 	limits    map[string]Limit       // by harness: the usage limit it last hit, until a run on it finishes without one
 	pending   map[string]*pendingRun // the recovery ledger, by pendingKey
 	authDown  map[string]bool        // by harness: a retried run on it could not sign in and the room was told, until a run on it finishes
+	sessionOf map[string]string      // by task id: the session its last run left, sent with its result
+	claudeDir string                 // Claude Code's config directory, where it keeps session titles
 
 	runLogMu sync.Mutex
 }
@@ -114,21 +117,23 @@ func New(cfg Config) (*Worker, error) {
 		return nil, err
 	}
 	w := &Worker{
-		cfg:      cfg,
-		client:   NewClient(cfg.ServerURL),
-		runners:  map[string]Runner{},
-		store:    st,
-		sem:      make(chan struct{}, cfg.MaxConcurrency),
-		now:      time.Now,
-		queues:   map[string]*queue{},
-		running:  map[string]running{},
-		locks:    map[string]*sessionLock{},
-		marks:    map[string]time.Time{},
-		limits:   map[string]Limit{},
-		pending:  map[string]*pendingRun{},
-		authDown: map[string]bool{},
-		files:    attachmentClient,
-		fileOK:   tankaFile,
+		cfg:       cfg,
+		client:    NewClient(cfg.ServerURL),
+		runners:   map[string]Runner{},
+		store:     st,
+		sem:       make(chan struct{}, cfg.MaxConcurrency),
+		now:       time.Now,
+		queues:    map[string]*queue{},
+		running:   map[string]running{},
+		locks:     map[string]*sessionLock{},
+		marks:     map[string]time.Time{},
+		limits:    map[string]Limit{},
+		pending:   map[string]*pendingRun{},
+		authDown:  map[string]bool{},
+		sessionOf: map[string]string{},
+		claudeDir: claudeConfigDir(),
+		files:     attachmentClient,
+		fileOK:    tankaFile,
 	}
 	for name, h := range cfg.Harnesses {
 		w.runners[name] = h.runner(cfg.timeout(), cfg.stall())
@@ -329,7 +334,7 @@ func (w *Worker) queueKey(t proto.Task) string {
 	if t.Trigger != "" {
 		return "task " + t.ID
 	}
-	if s, _, ok := w.addressed(t.RoomID, t.Text); ok {
+	if s, _, _, ok := w.target(t); ok {
 		w.mu.Lock()
 		current := w.roomLocked(t.RoomID).SessionID
 		w.mu.Unlock()
@@ -423,7 +428,10 @@ func (w *Worker) send(t proto.Task, text string) {
 func (w *Worker) post(t proto.Task, text string) {
 	rec := runRecord{Event: "result", Task: t.ID, Trigger: t.Trigger, Bytes: len(text)}
 	defer func() { w.logRun(rec) }()
-	res := proto.Result{Text: text}
+	w.mu.Lock()
+	res := proto.Result{Text: text, SessionID: w.sessionOf[t.ID]}
+	delete(w.sessionOf, t.ID)
+	w.mu.Unlock()
 	if tr := w.trigger(t.Trigger); tr != nil {
 		res.Theme = theme(tr.Themes, text)
 	}
@@ -495,14 +503,14 @@ func (w *Worker) handle(ctx context.Context, t proto.Task) string {
 		}
 		return w.prompt(ctx, t, Run{Harness: w.cfg.Harness, Workdir: tr.Workdir, Prompt: t.Text}, false)
 	}
-	if s, text, ok := w.addressed(t.RoomID, t.Text); ok {
+	if s, text, route, ok := w.target(t); ok {
 		if text == "" && len(t.Attachments) == 0 {
 			return fmt.Sprintf("Session `%s` is in `%s`. Start a message with its id to continue it, or `resume %s` to make it this room's current session.", short(s.ID), tilde(s.Workdir), short(s.ID))
 		}
 		if _, err := resolveWorkdir(w.cfg.WorkdirRoots, "/", s.Workdir); err != nil {
 			return "Cannot continue: " + err.Error()
 		}
-		return w.prompt(ctx, t, Run{Harness: s.harness(), Workdir: s.Workdir, SessionID: s.ID, Resume: true, Prompt: text}, false)
+		return w.prompt(ctx, t, Run{Harness: s.harness(), Workdir: s.Workdir, SessionID: s.ID, Resume: true, Prompt: text, Route: route}, false)
 	}
 	cmd := parseCommand(t.Text)
 	switch cmd.name {
@@ -523,7 +531,31 @@ func (w *Worker) handle(ctx context.Context, t proto.Task) string {
 			return msg
 		}
 	}
+	if cmd.name == "prompt" && t.ReplyMessageID != "" {
+		return w.promptOrHandOff(ctx, t, cmd.prompt)
+	}
 	return w.prompt(ctx, t, Run{Prompt: cmd.prompt}, true)
+}
+
+// target picks the session a task goes to other than through the room's selection: the
+// session whose id starts the text, or else, for a prompt, the one the server matched the
+// message the task quotes to (proto.Task.RouteSessionID). route is the footer's note on an
+// inferred one, so the room can see it and correct it with an id; a typed id needs none. A
+// matched session this room no longer has is no target.
+func (w *Worker) target(t proto.Task) (s Session, text, route string, ok bool) {
+	if s, text, ok := w.addressed(t.RoomID, t.Text); ok {
+		return s, text, "", true
+	}
+	if t.RouteSessionID == "" || t.Trigger != "" || parseCommand(t.Text).name != "prompt" {
+		return Session{}, "", "", false
+	}
+	w.mu.Lock()
+	s, ok = sessionByID(w.roomLocked(t.RoomID).Sessions, t.RouteSessionID)
+	w.mu.Unlock()
+	if !ok {
+		return Session{}, "", "", false
+	}
+	return s, strings.TrimSpace(t.Text), fmt.Sprintf("按引用的消息接到会话 `%s`", short(s.ID)), true
 }
 
 // addressed reports whether text starts with the id (or a 6+ character prefix of it) of one
@@ -657,6 +689,10 @@ func (w *Worker) run(ctx context.Context, t proto.Task, run Run, current bool) (
 		if !r.Resume {
 			r.SessionID = newUUID()
 		}
+		handoff := r.Others != "" && w.handsOff(h)
+		if handoff {
+			r.Prompt = r.Others + r.Prompt
+		}
 		res, err := w.attempt(ctx, t, r, current, text)
 		out.ran = true
 		if res.SessionID != "" || res.Stopped || r.Resume {
@@ -695,6 +731,9 @@ func (w *Worker) run(ctx context.Context, t proto.Task, run Run, current bool) (
 		out.end, out.noResult = end, (end == endError || end == endAuth) && err != nil
 		if end == endAuth {
 			out.harness = h
+		}
+		if handoff && end == "" {
+			out.handoff, out.handedOn = parseHandoff(res.Text)
 		}
 		return joinNotes(notes, w.format(ctx, t, r, res, err, skipped)), out
 	}
@@ -752,6 +791,7 @@ func (w *Worker) attempt(ctx context.Context, t proto.Task, run Run, current boo
 		}
 		rs.remember(Session{ID: sid, Workdir: run.Workdir, Title: preview(text, 40), LastUsed: w.now(), Harness: run.Harness})
 		w.saveLocked(t.RoomID)
+		w.sessionOf[t.ID] = sid
 	}
 	w.mu.Unlock()
 	log.Printf("task %s: finished in %s (error=%v, limit=%v, auth=%v)", t.ID, res.Duration.Round(time.Second), err != nil || res.IsError, res.Limit != nil, authFailed(res, err))
@@ -798,6 +838,9 @@ func (w *Worker) format(ctx context.Context, t proto.Task, run Run, res RunResul
 		fmt.Fprintf(&b, "%s · ", run.Harness)
 	}
 	fmt.Fprintf(&b, "session `%s`", session)
+	if run.Route != "" {
+		fmt.Fprintf(&b, " · %s", run.Route)
+	}
 	if t.Trigger != "" && session != "none" {
 		fmt.Fprintf(&b, " (to follow up, @ me and start with `%s`)", session)
 	}

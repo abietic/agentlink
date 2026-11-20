@@ -8,7 +8,7 @@ Tanka 群 ──@bot──▶ agentlink-server ◀──长轮询── agentlin
    └──────── response_url / 群 webhook ◀───────────┘
 ```
 
-- **server**：校验 Tanka 签名，按 `(bot, room_id)` 找到配对的设备，把任务加密后放进该设备在内存里的队列；worker 取走时，任务就从 server 上删掉，回帖去向（`response_url` 等）用 server 的存储密钥封好随任务交给 worker，worker 交回结果时带回来，server 据此回帖，失败再用该群的 incoming webhook。消息不落盘：SQLite 里只有设备、配对、server 的密钥和元数据（任务流水、worker 上报的状态，见「元数据与统计」）。
+- **server**：校验 Tanka 签名，按 `(bot, room_id)` 找到配对的设备，把任务加密后放进该设备在内存里的队列；worker 取走时，任务就从 server 上删掉，回帖去向（`response_url` 等）用 server 的存储密钥封好随任务交给 worker，worker 交回结果时带回来，server 据此回帖，失败再用该群的 incoming webhook。消息不落盘：SQLite 里只有设备、配对、server 的密钥和元数据（任务流水、worker 上报的状态、回帖与 @ 对应的会话，见「元数据与统计」）。
 - **worker**：凭 device id / token 与 server 配对，只发出站请求（不需要公网入口）。每个群在本机有自己的工作目录和当前会话：默认续接当前会话，也可以新建、切回旧会话或换目录。
 - **执行走官方 Agent SDK**：Go 没有官方 SDK，worker 每条 prompt 起一个 `node sdk/runner.mjs`，由它调用 `@anthropic-ai/claude-agent-sdk` 的 `query()`。新会话用 `options.sessionId`（worker 自己生成的 UUID），续接用 `options.resume`，会话 id 不变；SIGTERM 会 abort 这次 query，已做的部分留在会话里。`sdk_options` 原样传给 `query()`。
 
@@ -88,6 +88,14 @@ mirasim 的几点限制：
 | 其他任何内容 | 作为 prompt，在当前会话里执行 |
 
 命令词不区分大小写，可以带 `/`。
+
+引用一条消息再 @ 机器人时，Tanka 只给被引用消息的 id（`event.message.reply_message_id`），不给内容。这时按下面的顺序找会话，命中即停：
+
+1. 消息以会话 id 开头：照旧。
+2. server 认出了被引用的消息：被引用的是某人之前 @ 的消息，就接到那条消息跑过的会话；否则从 id 里解出发送时间（Tanka 消息 id 是 24 位 hex ObjectId，前 4 字节是 Unix 秒），找本群在那个时间前后 2 秒内发帖的会话，恰好一个且属于本机器人才算。命中后等同带了它的 id，回帖 footer 写「按引用的消息接到会话 X」。
+3. 都没命中：在本群当前会话里跑。如果是 sdk harness 且本群还有别的会话，消息前面附上最近 5 个其他会话（id、Claude Code 起的标题或首条内容、最后使用时间）；会话判断消息明显属于其中某个时只回 `[[handoff <id>]]`，worker 就把原消息（不带列表）在那个会话里重跑一次，footer 写「由会话 A 转到 X」。只转一跳；给的 id 不对就回一句说明。这条规则追加在 `sdk_options` 的系统提示词后面（已有 `systemPrompt` 时接在它的 `append` 或字符串之后，不覆盖），固定不变，不破坏提示缓存。mirasim 和 kimi 续接会话时加不了系统提示词，不附列表。
+
+推断出来的路由不对时，以会话 id 开头重发即可。命令（`new` 等）不受影响；没有引用的 @ 也照旧。
 
 **图片**：和 @ 同一条消息发出的图片（PNG / JPEG / GIF / WebP）会和文字一起交给 Claude；只发图不写字也算 prompt。图片来自事件里文档没写的 `attachments` 字段：server 只把下载链接加密转给 worker，由 worker 去下载，并且只下载 `tanka.ai` 域名下的 https 链接。每条消息最多 5 张，每张不超过 3.75 MB（API 对 base64 后 5 MB 的上限），超出的、不是图片的附件会在回帖里列出来，不会悄悄丢掉。
 
@@ -188,6 +196,7 @@ server 不存消息，但会存下面这些，用来管理、对账、排查和�
   - `lost`：server 重启时还没被取走。
 
   不存正文、附件链接和文件名、`response_url`。
+- **回帖与 @ 对应的会话 `posts` / `mentions`**（保留 90 天，用于上面的引用路由）：每次回帖的机器人、群 id、来自哪个会话（server 自己的提示为空）、发帖前后的时间；以及人发的每条 @ 消息的 Tanka 消息 id 和它跑在哪个会话。会话 id 由 worker 随结果报上来。日志里只记解出的时间、命中方式（`exact` / `time` / `none` / `ambiguous`）和会话 id，不记消息 id。
 - **设备水位 `device_stats`**：同时在排或在跑的任务数峰值及时间，以及 worker 每次轮询上报的状态：版本、在跑数、排队数、哪些 harness 在用量上限里到几点。这份状态放在请求头里，不加密（没有任务内容）。
 - **重启**：还没被取走的任务记为 `lost`。配了 webhook 的群会收到一条只有数量和来源的说明（如「2 个任务：mention ×1，`alerts` ×1」），没有内容。已取走的任务不受影响。
 - **worker 本地流水** `~/.agentlink/runs.jsonl`（保留 90 天）：

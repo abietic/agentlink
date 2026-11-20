@@ -231,6 +231,8 @@ type outcome struct {
 	noResult bool      // the harness failed without a result, e.g. it could not resume
 	retryAt  time.Time // with endLimit: when the earliest limit resets
 	notice   string    // with endLimit: what the room is told about the limit itself, once per limit
+	handedOn bool      // the run only handed the prompt on (see handoff.go)
+	handoff  string    // to this session id, as the run wrote it
 }
 
 // claim decides what a triggered task with a Recovery is. It returns a reply to send
