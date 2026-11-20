@@ -531,7 +531,8 @@ func (w *Worker) handle(ctx context.Context, t proto.Task) string {
 			return msg
 		}
 	}
-	if cmd.name == "prompt" && t.ReplyMessageID != "" {
+	// A bot's mention is not offered a hand-off: bots hand work to each other on purpose.
+	if cmd.name == "prompt" && t.SenderType != "bot" && !slices.Contains(w.cfg.AllowedBots, t.UserID) {
 		return w.promptOrHandOff(ctx, t, cmd.prompt)
 	}
 	return w.prompt(ctx, t, Run{Prompt: cmd.prompt}, true)
