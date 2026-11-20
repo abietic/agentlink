@@ -107,6 +107,13 @@ func TestMain(m *testing.M) {
 			json.NewEncoder(os.Stdout).Encode(out)
 			return
 		}
+		// Offered the room's other sessions, a message "handoff-to <id>" hands itself on.
+		if _, msg, ok := strings.Cut(req.Prompt, othersFooter+"\n\n"); ok && strings.HasPrefix(req.Prompt, othersHeader) {
+			if id, ok := strings.CutPrefix(msg, "handoff-to "); ok {
+				json.NewEncoder(os.Stdout).Encode(runReply{Type: "result", Text: "\n[[handoff " + id + "]]\n", SessionID: req.SessionID, NumTurns: 1})
+				return
+			}
+		}
 		cwd, _ := os.Getwd()
 		json.NewEncoder(os.Stdout).Encode(runReply{Type: "result", Text: "echo: " + req.Prompt + " @ " + cwd, SessionID: req.SessionID, NumTurns: 1, TotalCostUSD: 0.01})
 		return
@@ -224,7 +231,7 @@ func TestSessionLifecycle(t *testing.T) {
 		t.Fatalf("first reply: %q", reply)
 	}
 	first := f.last(t).SessionID
-	if !isUUID(first) || f.last(t).Resume || string(f.last(t).Options) != `{"permissionMode":"auto"}` {
+	if !isUUID(first) || f.last(t).Resume || !strings.Contains(string(f.last(t).Options), `"permissionMode":"auto"`) {
 		t.Fatalf("first run: %+v", f.last(t))
 	}
 
@@ -443,11 +450,15 @@ func TestEndToEnd(t *testing.T) {
 	go func() { done <- w.Run(ctx) }()
 
 	n := 0
-	say := func(user, text string) string {
+	sayWith := func(user, text string, mod func(*tanka.MentionEvent)) string {
 		n++
-		body, _ := json.Marshal(tanka.Envelope{Type: "event_callback", EventID: fmt.Sprint("e", n), Event: &tanka.MentionEvent{
+		ev := &tanka.MentionEvent{
 			Type: "app_mention", UserID: user, RoomID: "room-canary-77", Text: "@bot " + text, ResponseURL: fake.URL + "/hooks/response/" + strconv.Itoa(n),
-		}})
+		}
+		if mod != nil {
+			mod(ev)
+		}
+		body, _ := json.Marshal(tanka.Envelope{Type: "event_callback", EventID: fmt.Sprint("e", n), Event: ev})
 		ts := strconv.FormatInt(time.Now().Unix(), 10)
 		req, _ := http.NewRequest(http.MethodPost, hs.URL+"/tanka/events", bytes.NewReader(body))
 		req.Header.Set(tanka.HeaderTimestamp, ts)
@@ -465,6 +476,7 @@ func TestEndToEnd(t *testing.T) {
 			return ""
 		}
 	}
+	say := func(user, text string) string { return sayWith(user, text, nil) }
 
 	if r := say("U1", "pair "+w.DeviceID()); !strings.Contains(r, "Paired") {
 		t.Fatalf("pair: %q", r)
@@ -480,6 +492,17 @@ func TestEndToEnd(t *testing.T) {
 	}
 	if r := say("U1", "zebra-canary"); !strings.Contains(r, "echo: zebra-canary") {
 		t.Fatalf("canary: %q", r)
+	}
+	// A reply that quotes an earlier mention goes to the session that mention ran in: the
+	// worker's result named it, and the server kept it by the mention's message id.
+	sayWith("U1", "first topic", func(ev *tanka.MentionEvent) { ev.MessageID = "msg-first" })
+	firstSession := f.last(t).SessionID
+	say("U1", "new second topic")
+	r = sayWith("U1", "follow up", func(ev *tanka.MentionEvent) {
+		ev.MessageID, ev.Message = "msg-follow", &tanka.MessageSnapshot{ReplyMessageID: "msg-first"}
+	})
+	if got := f.last(t); got.SessionID != firstSession || got.Prompt != "follow up" || !strings.Contains(r, "按引用的消息接到会话 `"+firstSession[:8]+"`") {
+		t.Fatalf("quoted follow-up ran in %s, not %s: %q", got.SessionID, firstSession, r)
 	}
 	if r := say(member, "who asked"); !strings.HasPrefix(r, "<@"+member+">\n\necho: who asked") {
 		t.Fatalf("reply to a member does not mention them first: %q", r)
@@ -525,7 +548,7 @@ func TestEndToEnd(t *testing.T) {
 	// Refusals and status are posted on their own goroutines, which log once the server answers.
 	var runs []byte
 	for deadline := time.Now().Add(5 * time.Second); time.Now().Before(deadline); time.Sleep(20 * time.Millisecond) {
-		if runs, _ = os.ReadFile(filepath.Join(f.cfg.StateDir, "runs.jsonl")); bytes.Count(runs, []byte(`"event":"result"`)) >= 8 {
+		if runs, _ = os.ReadFile(filepath.Join(f.cfg.StateDir, "runs.jsonl")); bytes.Count(runs, []byte(`"event":"result"`)) >= 11 {
 			break
 		}
 	}
@@ -540,9 +563,9 @@ func TestEndToEnd(t *testing.T) {
 		}
 		events[r.Event]++
 	}
-	// Pairing and early "offline" pings are the server's; the worker answered 7 mentions, ran 4
+	// Pairing and early "offline" pings are the server's; the worker answered 10 mentions, ran 7
 	// of them, and closed the refused bot's task with an empty result.
-	if events["run"] != 4 || events["result"] != 8 {
+	if events["run"] != 7 || events["result"] != 11 {
 		t.Errorf("run log events: %v\n%s", events, runs)
 	}
 	var stats bytes.Buffer

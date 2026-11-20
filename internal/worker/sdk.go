@@ -23,6 +23,11 @@ type Run struct {
 	Prompt    string
 	Images    []Image // go in the same message as Prompt, before it
 	UserID    string  // the Tanka user who sent it; empty for triggers
+	// Route is the reply footer's note on how an inferred session was picked; runners ignore it.
+	Route string
+	// Others lists the room's other sessions for a hand-off (see handoff.go). It goes before
+	// Prompt only on a harness that has the hand-off rule; runners ignore it.
+	Others string
 }
 
 type RunResult struct {

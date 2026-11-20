@@ -76,6 +76,24 @@ type MentionEvent struct {
 	// Attachments has one item per file or image sent with the mention (or with the batch it
 	// was sent in), [] for text only. Each url is a download link that needs no login.
 	Attachments []Attachment `json:"attachments"`
+	// Message is the mention's own message snapshot, sent since late 2026-11; older events
+	// have none. It never holds the text of a message it quotes.
+	Message *MessageSnapshot `json:"message"`
+}
+
+// MessageSnapshot is the part of Tanka's public message structure this project uses.
+type MessageSnapshot struct {
+	// ReplyMessageID is the id of the message this one quotes; Tanka leaves it out otherwise.
+	ReplyMessageID string `json:"reply_message_id"`
+}
+
+// ReplyMessageID is the id of the message the mention quotes, or "" for one that quotes
+// nothing or comes from before Tanka sent event.message.
+func (e MentionEvent) ReplyMessageID() string {
+	if e.Message == nil {
+		return ""
+	}
+	return e.Message.ReplyMessageID
 }
 
 // Attachment is the part of an attachments item this project uses. Tanka also sends

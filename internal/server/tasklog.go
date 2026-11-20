@@ -57,10 +57,13 @@ func (s *Server) logDone(id, outcome string, resultBytes int) {
 }
 
 // sweepLog closes tasks taken before a restart whose lease has ended (the ones taken since
-// are closed by reapExpired), and forgets tasks older than logRetention.
+// are closed by reapExpired), and forgets tasks, posts and mentions older than logRetention.
 func (s *Server) sweepLog(now time.Time) {
 	s.logExec("sweep", `UPDATE task_log SET outcome = ?, done_at = lease_until WHERE outcome IS NULL AND lease_until < ?`, outNoResult, now.UnixMilli())
-	s.logExec("retention", `DELETE FROM task_log WHERE queued_at < ?`, now.Add(-logRetention).UnixMilli())
+	cutoff := now.Add(-logRetention).UnixMilli()
+	s.logExec("retention", `DELETE FROM task_log WHERE queued_at < ?`, cutoff)
+	s.logExec("retention", `DELETE FROM posts WHERE post_end < ?`, cutoff)
+	s.logExec("retention", `DELETE FROM mentions WHERE at < ?`, cutoff)
 }
 
 // markLost closes the tasks that were still waiting when the server last stopped: they lived

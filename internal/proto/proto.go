@@ -50,6 +50,14 @@ type Task struct {
 	// Attachments sent with the mention. The worker downloads the images among them; the
 	// server only passes the links on, sealed, since anyone holding one can download it.
 	Attachments []Attachment `json:"attachments,omitempty"`
+	// ReplyMessageID is set when the mention quotes another message (Tanka's
+	// event.message.reply_message_id). Tanka does not send the quoted text.
+	ReplyMessageID string `json:"reply_message_id,omitempty"`
+	// RouteSessionID is the session the server matched the quoted message to: the session a
+	// person's earlier mention ran in, or the one a reply posted at the quoted message's time
+	// came from. The worker treats it like a session id at the start of the text, unless the
+	// text starts with one.
+	RouteSessionID string `json:"route_session_id,omitempty"`
 	// Reply is the Envelope's Reply, kept by the worker to send back with the result.
 	Reply []byte `json:"-"`
 }
@@ -64,6 +72,9 @@ type Attachment struct {
 type Result struct {
 	Text  string `json:"text"`
 	Theme string `json:"theme,omitempty"` // Tanka message theme, see tanka.Themes
+	// SessionID is the session the reply came from, if a run made it; the server keeps it
+	// with the post so a later reply quoting it can be routed there (see RouteSessionID).
+	SessionID string `json:"session_id,omitempty"`
 }
 
 // TriggerRequest asks the server to queue a triggered task for the device paired with
