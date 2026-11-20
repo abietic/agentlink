@@ -43,7 +43,12 @@ func TestMain(m *testing.M) {
 		f, _ := os.OpenFile(logPath, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o600)
 		json.NewEncoder(f).Encode(req)
 		f.Close()
-		if req.Prompt == "sleep" {
+		// Control words are read past any list of other sessions put before the message.
+		word := req.Prompt
+		if _, msg, ok := strings.Cut(word, othersFooter+"\n\n"); ok && strings.HasPrefix(word, othersHeader) {
+			word = msg
+		}
+		if word == "sleep" {
 			time.Sleep(5 * time.Second)
 		}
 		progress := func() { json.NewEncoder(os.Stdout).Encode(runReply{Type: "progress", SessionID: req.SessionID}) }
@@ -55,7 +60,7 @@ func TestMain(m *testing.M) {
 			progress()
 			time.Sleep(5 * time.Second)
 		}
-		switch req.Prompt {
+		switch word {
 		case "stall":
 			stall()
 		case "busy": // slower than the stall window in all, but never silent for that long
@@ -95,7 +100,7 @@ func TestMain(m *testing.M) {
 				fail("boom")
 			}
 		}
-		for req.Prompt == "wait" {
+		for word == "wait" {
 			if _, err := os.Stat(os.Getenv("AGENTLINK_STUB_GATE")); err == nil {
 				break
 			}
@@ -108,8 +113,8 @@ func TestMain(m *testing.M) {
 			return
 		}
 		// Offered the room's other sessions, a message "handoff-to <id>" hands itself on.
-		if _, msg, ok := strings.Cut(req.Prompt, othersFooter+"\n\n"); ok && strings.HasPrefix(req.Prompt, othersHeader) {
-			if id, ok := strings.CutPrefix(msg, "handoff-to "); ok {
+		if word != req.Prompt {
+			if id, ok := strings.CutPrefix(word, "handoff-to "); ok {
 				json.NewEncoder(os.Stdout).Encode(runReply{Type: "result", Text: "\n[[handoff " + id + "]]\n", SessionID: req.SessionID, NumTurns: 1})
 				return
 			}
@@ -504,7 +509,8 @@ func TestEndToEnd(t *testing.T) {
 	if got := f.last(t); got.SessionID != firstSession || got.Prompt != "follow up" || !strings.Contains(r, "按引用的消息接到会话 `"+firstSession[:8]+"`") {
 		t.Fatalf("quoted follow-up ran in %s, not %s: %q", got.SessionID, firstSession, r)
 	}
-	if r := say(member, "who asked"); !strings.HasPrefix(r, "<@"+member+">\n\necho: who asked") {
+	// (The echo runner echoes the list of the room's other sessions put before the prompt.)
+	if r := say(member, "who asked"); !strings.HasPrefix(r, "<@"+member+">\n\necho: ") || !strings.Contains(r, "\n\nwho asked") {
 		t.Fatalf("reply to a member does not mention them first: %q", r)
 	}
 	if r := say(bot, "handed on"); !strings.HasPrefix(r, "echo: handed on") {

@@ -69,23 +69,32 @@ func TestParseHandoff(t *testing.T) {
 	}
 }
 
-func TestClaudeTitle(t *testing.T) {
+func TestClaudeSummary(t *testing.T) {
 	dir := t.TempDir()
 	const workdir, id = "/Users/someone/Code/my.app dir_x", "016be2cf-4c44-4ece-9c65-33a472b5715d"
 	project := filepath.Join(dir, "projects", "-Users-someone-Code-my-app-dir-x")
 	os.MkdirAll(project, 0o700)
-	os.WriteFile(filepath.Join(project, id+".jsonl"), []byte(`{"type":"user","message":"mentions \"ai-title\" in passing"}
+	os.WriteFile(filepath.Join(project, id+".jsonl"), []byte(`{"type":"user","message":{"content":"mentions \"ai-title\" in passing"}}
 {"type":"ai-title","aiTitle":"First title","sessionId":"`+id+`"}
-{"type":"assistant"}
+{"type":"assistant","message":{"content":[{"type":"text","text":"answer"}]}}
+{"type":"user","message":{"content":[{"type":"tool_result","content":"tool output"}]}}
+{"type":"user","isMeta":true,"message":{"content":"meta"}}
+{"type":"user","message":{"content":"现在在接下来的对话里\n你要扮演 glados"}}
 {"type":"ai-title","aiTitle":"Sentry alert THETA-1T6","sessionId":"`+id+`"}
 {"type":"ai-title","aiTitle":"  ","sessionId":"`+id+`"}
+{"type":"user","message":{"content":[{"type":"text","text":"[AgentLink] Other sessions in this room (id · last used · title):\n- abc · x\n`+othersFooter+`\n\n这里我说了什么"}]}}
+{"type":"user","message":{"content":[{"type":"text","text":"GLaDOS 看我请来了谁"}]}}
 {"type":"assistant"}`), 0o600)
-	if got := claudeTitle(dir, workdir, id); got != "Sentry alert THETA-1T6" {
-		t.Errorf("title = %q", got)
+	title, recent := claudeSummary(dir, workdir, id)
+	if title != "Sentry alert THETA-1T6" {
+		t.Errorf("title = %q", title)
+	}
+	if want := []string{"现在在接下来的对话里 你要扮演 glados", "这里我说了什么", "GLaDOS 看我请来了谁"}; strings.Join(recent, "|") != strings.Join(want, "|") {
+		t.Errorf("recent = %q", recent)
 	}
 	for _, c := range [][2]string{{workdir, "00000000-0000-0000-0000-000000000000"}, {"/elsewhere", id}, {workdir, "../" + id}} {
-		if got := claudeTitle(dir, c[0], c[1]); got != "" {
-			t.Errorf("claudeTitle(%q, %q) = %q", c[0], c[1], got)
+		if title, recent := claudeSummary(dir, c[0], c[1]); title != "" || recent != nil {
+			t.Errorf("claudeSummary(%q, %q) = %q, %q", c[0], c[1], title, recent)
 		}
 	}
 }
@@ -97,9 +106,9 @@ func TestHandsOffOnlyOnSDK(t *testing.T) {
 	}
 }
 
-// TestQuotedReplyRouting: a quoted prompt goes to a session id it starts with, else to the
-// session the server matched the quote to, else to the room's current session, which is shown
-// the room's other sessions and may hand the prompt on once. Nothing is held back any more.
+// TestQuotedReplyRouting: a prompt goes to a session id it starts with, else to the session
+// the server matched its quote to, else to the room's current session, which is shown the
+// room's other sessions and may hand the prompt on once. Nothing is held back any more.
 func TestQuotedReplyRouting(t *testing.T) {
 	f := newFixture(t)
 	w, err := New(f.cfg)
@@ -129,7 +138,8 @@ func TestQuotedReplyRouting(t *testing.T) {
 	}
 	project := filepath.Join(w.claudeDir, "projects", notAlnum.ReplaceAllString(f.root, "-"))
 	os.MkdirAll(project, 0o700)
-	os.WriteFile(filepath.Join(project, first+".jsonl"), []byte(`{"type":"ai-title","aiTitle":"Sentry alert THETA-1T6"}`+"\n"), 0o600)
+	os.WriteFile(filepath.Join(project, first+".jsonl"), []byte(`{"type":"ai-title","aiTitle":"Sentry alert THETA-1T6"}`+"\n"+
+		`{"type":"user","message":{"content":"现在扮演 glados"}}`+"\n"), 0o600)
 
 	// Layer 2: the session the server matched, as if the text started with its id.
 	r := w.handle(ctx, task("这个告警要处理吗", "m1", first))
@@ -161,7 +171,7 @@ func TestQuotedReplyRouting(t *testing.T) {
 		got := f.last(t)
 		want := othersHeader + "\n- " + second[:8] + " · "
 		if !got.Resume || got.SessionID != third || !strings.HasPrefix(got.Prompt, want) || !strings.HasSuffix(got.Prompt, othersFooter+"\n\n这个要处理吗") ||
-			!strings.Contains(got.Prompt, "- "+first[:8]+" · ") || !strings.Contains(got.Prompt, "Sentry alert THETA-1T6") || !strings.Contains(got.Prompt, "redis timeout") ||
+			!strings.Contains(got.Prompt, "- "+first[:8]+" · ") || !strings.Contains(got.Prompt, "Sentry alert THETA-1T6 · 「现在扮演 glados」") || !strings.Contains(got.Prompt, "redis timeout") ||
 			strings.Contains(got.Prompt, third[:8]) {
 			t.Fatalf("route %q: default session's prompt:\n%s", route, got.Prompt)
 		}
@@ -187,10 +197,17 @@ func TestQuotedReplyRouting(t *testing.T) {
 			t.Fatalf("hand-off to %q: %d runs, reply %q", bad, runs()-before, r)
 		}
 	}
-	// Unquoted prompts are never shown the list.
+	// An unquoted prompt is shown the list too: a room reuses sessions, and people rarely quote.
 	w.handle(ctx, task("plain follow-up", "", ""))
-	if got := f.last(t); got.SessionID != third || got.Prompt != "plain follow-up" {
+	if got := f.last(t); got.SessionID != third || !strings.HasPrefix(got.Prompt, othersHeader) || !strings.HasSuffix(got.Prompt, "\n\nplain follow-up") {
 		t.Fatalf("unquoted prompt: %+v", got)
+	}
+	// A bot's mention is not: bots hand work to each other on purpose.
+	bot := task("bot follow-up", "", "")
+	bot.SenderType = "bot"
+	w.handle(ctx, bot)
+	if got := f.last(t); got.SessionID != third || got.Prompt != "bot follow-up" {
+		t.Fatalf("bot prompt: %+v", got)
 	}
 	// The rule rides on every SDK run's system prompt, after the config's own append.
 	var opts struct{ SystemPrompt struct{ Append string } }

@@ -18,8 +18,8 @@ import (
 	"agentlink/internal/proto"
 )
 
-// A prompt that quotes a message the server could not match to a session runs in the room's
-// current session, as any prompt does. On a harness that has handoffRule in its system prompt
+// A person's prompt that names no session, and quotes no message the server could match to
+// one, runs in the room's current session, as any prompt does. On a harness that has handoffRule in its system prompt
 // it goes with a list of the room's other sessions first, and the session may answer only
 // [[handoff <id>]]: the prompt then runs again, without the list, in that session, whose
 // reply is the one posted. A prompt is handed on once at most.
@@ -29,7 +29,7 @@ import (
 const handoffRule = `This session is driven from a Tanka group chat through AgentLink. A message may begin with a block headed "[AgentLink] Other sessions in this room". When it does, and the message is clearly unrelated to this session but clearly about one of the sessions in that block, reply with exactly one line, [[handoff <id>]], with that session's id from the block, and do nothing else. If you are not sure, answer the message normally and ignore the block.`
 
 const (
-	othersHeader = "[AgentLink] Other sessions in this room (id · last used · title):"
+	othersHeader = "[AgentLink] Other sessions in this room (id · last used · title · recent prompts, newest last):"
 	othersFooter = "[End of list. The message from the room follows.]"
 )
 
@@ -85,7 +85,11 @@ func parseHandoff(text string) (string, bool) {
 	return strings.ToLower(strings.Trim(m[1], " `#<>")), true
 }
 
-// promptOrHandOff runs a quoted prompt in the room's current session, offering it the room's
+// recentPrompts is how many of a session's latest prompts its line in the list shows: a
+// session's title is set early and goes stale when the room keeps reusing it.
+const recentPrompts = 3
+
+// promptOrHandOff runs a prompt in the room's current session, offering it the room's
 // other sessions to hand it on to.
 func (w *Worker) promptOrHandOff(ctx context.Context, t proto.Task, prompt string) string {
 	others := w.othersBlock(t.RoomID)
@@ -134,8 +138,12 @@ func (w *Worker) othersBlock(roomID string) string {
 	var b strings.Builder
 	b.WriteString(othersHeader + "\n")
 	for _, s := range others {
-		title := cmp.Or(claudeTitle(w.claudeDir, s.Workdir, s.ID), s.Title)
-		fmt.Fprintf(&b, "- %s · %s · %s\n", short(s.ID), s.LastUsed.Local().Format("01-02 15:04"), preview(title, 60))
+		title, recent := claudeSummary(w.claudeDir, s.Workdir, s.ID)
+		fmt.Fprintf(&b, "- %s · %s · %s", short(s.ID), s.LastUsed.Local().Format("01-02 15:04"), preview(cmp.Or(title, s.Title), 60))
+		for _, p := range recent {
+			fmt.Fprintf(&b, " · 「%s」", preview(p, 40))
+		}
+		b.WriteString("\n")
 	}
 	b.WriteString(othersFooter + "\n\n")
 	return b.String()
@@ -152,23 +160,25 @@ func claudeConfigDir() string {
 
 var notAlnum = regexp.MustCompile(`[^A-Za-z0-9]`)
 
-// claudeTitle is the last title Claude Code gave session id, from the "ai-title" lines of its
-// transcript, projects/<workdir with every character but letters and digits as "-">/<id>.jsonl
-// under dir. It returns "" if there is none, or no such transcript (another harness's session).
-func claudeTitle(dir, workdir, id string) string {
+// claudeSummary is the last title Claude Code gave session id, from the "ai-title" lines of
+// its transcript, and the session's last recentPrompts prompts, oldest first, without any list
+// of other sessions put before them. The transcript is projects/<workdir with every character
+// but letters and digits as "-">/<id>.jsonl under dir. Both are empty if there is no such
+// transcript (another harness's session).
+func claudeSummary(dir, workdir, id string) (title string, recent []string) {
 	if dir == "" || workdir == "" || id == "" || filepath.Base(id) != id {
-		return ""
+		return "", nil
 	}
 	f, err := os.Open(filepath.Join(dir, "projects", notAlnum.ReplaceAllString(workdir, "-"), id+".jsonl"))
 	if err != nil {
-		return ""
+		return "", nil
 	}
 	defer f.Close()
-	title := ""
 	r := bufio.NewReaderSize(f, 1<<16)
 	for {
 		line, err := r.ReadBytes('\n')
-		if bytes.Contains(line, []byte(`"ai-title"`)) {
+		switch {
+		case bytes.Contains(line, []byte(`"ai-title"`)):
 			var rec struct {
 				Type    string `json:"type"`
 				AITitle string `json:"aiTitle"`
@@ -176,12 +186,58 @@ func claudeTitle(dir, workdir, id string) string {
 			if json.Unmarshal(line, &rec) == nil && rec.Type == "ai-title" && strings.TrimSpace(rec.AITitle) != "" {
 				title = rec.AITitle
 			}
+		case bytes.Contains(line, []byte(`"type":"user"`)):
+			if p := userPrompt(line); p != "" {
+				recent = append(recent, p)
+				if len(recent) > recentPrompts {
+					recent = recent[1:]
+				}
+			}
 		}
 		if err != nil {
 			if !errors.Is(err, io.EOF) {
-				log.Printf("session %s: reading its title: %v", short(id), err)
+				log.Printf("session %s: reading its transcript: %v", short(id), err)
 			}
-			return title
+			return title, recent
 		}
 	}
+}
+
+// userPrompt is the text a person typed in a transcript line, or "" for any other line: a
+// tool result, an injected meta message, or one without text. A list of other sessions put
+// before the prompt is cut off.
+func userPrompt(line []byte) string {
+	var rec struct {
+		Type    string `json:"type"`
+		IsMeta  bool   `json:"isMeta"`
+		Message struct {
+			Content json.RawMessage `json:"content"`
+		} `json:"message"`
+	}
+	if json.Unmarshal(line, &rec) != nil || rec.Type != "user" || rec.IsMeta {
+		return ""
+	}
+	var text string
+	if json.Unmarshal(rec.Message.Content, &text) != nil {
+		var blocks []struct{ Type, Text string }
+		if json.Unmarshal(rec.Message.Content, &blocks) != nil {
+			return ""
+		}
+		var parts []string
+		for _, b := range blocks {
+			if b.Type == "tool_result" {
+				return ""
+			}
+			if b.Type == "text" {
+				parts = append(parts, b.Text)
+			}
+		}
+		text = strings.Join(parts, " ")
+	}
+	if strings.HasPrefix(text, othersHeader[:len("[AgentLink] Other sessions in this room")]) {
+		if _, rest, ok := strings.Cut(text, othersFooter); ok {
+			text = rest
+		}
+	}
+	return strings.Join(strings.Fields(text), " ")
 }
