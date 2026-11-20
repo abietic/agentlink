@@ -84,8 +84,12 @@ func TestClaudeSummary(t *testing.T) {
 {"type":"ai-title","aiTitle":"  ","sessionId":"`+id+`"}
 {"type":"user","message":{"content":[{"type":"text","text":"[AgentLink] Other sessions in this room (id · last used · title):\n- abc · x\n`+othersFooter+`\n\n这里我说了什么"}]}}
 {"type":"user","message":{"content":[{"type":"text","text":"GLaDOS 看我请来了谁"}]}}
+{"type":"user","message":{"content":"<task-notification> <task-id>b1</task-id> done"}}
+{"type":"user","message":{"content":"`+defaultResumePrompt+`"}}
+{"type":"user","message":{"content":"configured resume"}}
 {"type":"assistant"}`), 0o600)
-	title, recent := claudeSummary(dir, workdir, id)
+	w := &Worker{cfg: Config{Recovery: map[string]Recovery{"sentry": {ResumePrompt: "configured\n resume"}}}}
+	title, recent := claudeSummary(dir, workdir, id, w.notTyped)
 	if title != "Sentry alert THETA-1T6" {
 		t.Errorf("title = %q", title)
 	}
@@ -93,8 +97,22 @@ func TestClaudeSummary(t *testing.T) {
 		t.Errorf("recent = %q", recent)
 	}
 	for _, c := range [][2]string{{workdir, "00000000-0000-0000-0000-000000000000"}, {"/elsewhere", id}, {workdir, "../" + id}} {
-		if title, recent := claudeSummary(dir, c[0], c[1]); title != "" || recent != nil {
+		if title, recent := claudeSummary(dir, c[0], c[1], nil); title != "" || recent != nil {
 			t.Errorf("claudeSummary(%q, %q) = %q, %q", c[0], c[1], title, recent)
+		}
+	}
+}
+
+func TestNotTyped(t *testing.T) {
+	w := &Worker{}
+	for _, p := range []string{"<task-notification> <task-id>x</task-id>", "<system-reminder>hi", "<scheduled-task name=\"x\">", "<local-command-stdout></local-command-stdout>", "<br/>", defaultResumePrompt} {
+		if !w.notTyped(p) {
+			t.Errorf("%q counts as typed", p)
+		}
+	}
+	for _, p := range []string{"GLaDOS 看我请来了谁", "<[at]Mirasim Link> 算出 17+25", "< 3 items", "<3", "ok <tag>"} {
+		if w.notTyped(p) {
+			t.Errorf("%q counts as injected", p)
 		}
 	}
 }

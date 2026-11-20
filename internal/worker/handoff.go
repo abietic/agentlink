@@ -138,7 +138,7 @@ func (w *Worker) othersBlock(roomID string) string {
 	var b strings.Builder
 	b.WriteString(othersHeader + "\n")
 	for _, s := range others {
-		title, recent := claudeSummary(w.claudeDir, s.Workdir, s.ID)
+		title, recent := claudeSummary(w.claudeDir, s.Workdir, s.ID, w.notTyped)
 		fmt.Fprintf(&b, "- %s · %s · %s", short(s.ID), s.LastUsed.Local().Format("01-02 15:04"), preview(cmp.Or(title, s.Title), 60))
 		for _, p := range recent {
 			fmt.Fprintf(&b, " · 「%s」", preview(p, 40))
@@ -162,10 +162,10 @@ var notAlnum = regexp.MustCompile(`[^A-Za-z0-9]`)
 
 // claudeSummary is the last title Claude Code gave session id, from the "ai-title" lines of
 // its transcript, and the session's last recentPrompts prompts, oldest first, without any list
-// of other sessions put before them. The transcript is projects/<workdir with every character
+// of other sessions put before them and leaving out those skip says nobody typed. The transcript is projects/<workdir with every character
 // but letters and digits as "-">/<id>.jsonl under dir. Both are empty if there is no such
 // transcript (another harness's session).
-func claudeSummary(dir, workdir, id string) (title string, recent []string) {
+func claudeSummary(dir, workdir, id string, skip func(string) bool) (title string, recent []string) {
 	if dir == "" || workdir == "" || id == "" || filepath.Base(id) != id {
 		return "", nil
 	}
@@ -187,7 +187,7 @@ func claudeSummary(dir, workdir, id string) (title string, recent []string) {
 				title = rec.AITitle
 			}
 		case bytes.Contains(line, []byte(`"type":"user"`)):
-			if p := userPrompt(line); p != "" {
+			if p := userPrompt(line); p != "" && (skip == nil || !skip(p)) {
 				recent = append(recent, p)
 				if len(recent) > recentPrompts {
 					recent = recent[1:]
@@ -240,4 +240,22 @@ func userPrompt(line []byte) string {
 		}
 	}
 	return strings.Join(strings.Fields(text), " ")
+}
+
+// injected is a prompt that opens with a tag, as Claude Code's own messages do: a background
+// task's <task-notification>, a <system-reminder>, a scheduled task, a command's output.
+var injected = regexp.MustCompile(`^<[a-z][a-z0-9_-]*[\s/>]`)
+
+// notTyped reports whether a transcript prompt is one no person typed: one Claude Code
+// injected, or the prompt the worker continues an interrupted triggered task with.
+func (w *Worker) notTyped(p string) bool {
+	if injected.MatchString(p) || p == defaultResumePrompt {
+		return true
+	}
+	for _, r := range w.cfg.Recovery {
+		if p == strings.Join(strings.Fields(r.ResumePrompt), " ") {
+			return true
+		}
+	}
+	return false
 }
