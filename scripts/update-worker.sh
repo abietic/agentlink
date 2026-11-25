@@ -25,6 +25,14 @@ gh release download "$tag" --repo "$REPO" --dir "$tmp" -p "$asset" -p agentlink-
 for f in "$asset" agentlink-sdk.tar.gz; do
   gh attestation verify "$tmp/$f" --repo "$REPO" --signer-workflow "$REPO/.github/workflows/release.yml" --source-ref "refs/tags/$tag" >/dev/null
 done
+# macOS keys privacy grants (Files and Folders, Full Disk Access) to the binary's signature,
+# and the linker's ad-hoc one changes with every build, so each update asks again. With a
+# code-signing identity set, the verified binary is re-signed under a fixed identifier, and a
+# grant given once lasts across updates. A failed signing keeps the installed version.
+sign_id=${AGENTLINK_CODESIGN_ID:-$(cat "$HOME_DIR/codesign-id" 2>/dev/null || true)}
+if [[ -n $sign_id ]]; then
+  codesign -f -s "$sign_id" -i com.abietic.agentlink.worker "$tmp/$asset"
+fi
 mkdir "$tmp/sdk"
 tar -xzf "$tmp/agentlink-sdk.tar.gz" -C "$tmp/sdk" --strip-components 1
 (cd "$tmp/sdk" && npm ci --omit=dev --no-audit --no-fund --loglevel=error)
