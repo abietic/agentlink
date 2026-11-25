@@ -233,6 +233,7 @@ AGENTLINK_ENROLL_TOKEN=... agentlink-worker
 - 推 `v*` tag 触发 `.github/workflows/release.yml`：跑测试，构建 server（Linux amd64 / arm64）、worker（macOS arm64 / amd64）和 SDK runner 包，生成 `SHA256SUMS`，用 GitHub artifact attestation 记录构建来源，发成 Release。日常 push 和 PR 由 `ci.yml` 跑 gofmt、vet 和 `go test -race`。
 - **server**：把 `scripts/update-server.sh` 放到 `/opt/agentlink/`，装上 `examples/agentlink-update.service` 和 `.timer`（`AGENTLINK_HEALTH` 改成 server 的监听地址）。每小时检查一次：有新版本就下载、校验 sha256，再用 `gh attestation verify` 确认它是本仓库 `release.yml` 在对应 tag 上构建的（证明包从公开 API 取，不用登录 GitHub；`gh` 放在 `/opt/agentlink/bin/gh`），然后替换、重启 `agentlink-server`。任何一项校验不过就不装，正在跑的版本不受影响。`update-server.sh --check` 只下载和校验、不安装；`/healthz` 20 秒内不通就换回旧版本，之后不再重试这个版本。只动 agentlink 自己的单元。
 - **worker**：把 `scripts/update-worker.sh` 放到 `~/.agentlink/bin/`，装上 `examples/com.agentlink.update.plist`。每小时检查一次：下载 worker 和 SDK runner，校验 sha256 并用 `gh attestation verify` 确认是本仓库 `release.yml` 在对应 tag 上构建的（需要已登录的 `gh`），在 `~/.agentlink/sdk` 里 `npm ci`，等所有 worker 都没有正在跑的 prompt 时替换并重启它们。用自动更新时，`runner` 指向 `~/.agentlink/sdk/runner.mjs`。
+  - 可选，固定签名：macOS 的「文件与文件夹」「完全磁盘访问」授权按程序签名记，worker 自带的临时签名每次构建都不同，所以每次更新后子进程访问「文稿」等目录都会重新弹窗，人不在时任务就卡住。在钥匙串里放一个代码签名身份（自签名即可，证书不需要设为受信任），把它的名字或 SHA-1 写进 `~/.agentlink/codesign-id`（或设环境变量 `AGENTLINK_CODESIGN_ID`）。之后更新脚本会在构建来源校验通过后，用这个身份、以固定标识 `com.abietic.agentlink.worker` 重新签名，授权一次就能跨版本保留。导入身份时加 `-T /usr/bin/codesign`，后台签名就不会再弹钥匙串确认。
 
 ## 安全模型
 
