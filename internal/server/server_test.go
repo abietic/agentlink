@@ -32,12 +32,20 @@ type posted struct {
 
 type fakeTanka struct {
 	*httptest.Server
-	msgs chan posted
+	msgs  chan posted
+	fails atomic.Int32 // posts still to answer with HTTP 502
+	tries atomic.Int32 // posts received, answered or not
 }
 
 func newFakeTanka(t *testing.T) *fakeTanka {
 	f := &fakeTanka{msgs: make(chan posted, 16)}
 	f.Server = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		f.tries.Add(1)
+		if f.fails.Add(-1) >= 0 {
+			http.Error(w, "bad gateway", http.StatusBadGateway)
+			return
+		}
+		f.fails.Store(0)
 		var m tanka.Message
 		json.NewDecoder(r.Body).Decode(&m)
 		f.msgs <- posted{r.URL.Path, m.Text}
@@ -629,5 +637,52 @@ func TestAfterMention(t *testing.T) {
 		if got := afterMention(in, names); got != want {
 			t.Errorf("afterMention(%q) = %q, want %q", in, got, want)
 		}
+	}
+}
+
+// TestReplySurvivesTankaOutage checks that a result Tanka answers with 5xx is posted on a
+// quick retry, and, when Tanka keeps failing through those, on a later try.
+func TestReplySurvivesTankaOutage(t *testing.T) {
+	s, base, ft := newTestServer(t, nil)
+	s.retryWait = time.Millisecond
+	s.laterWaits = []time.Duration{50 * time.Millisecond}
+	dev := register(t, base, "")
+	sendEvent(t, base, mention(ft, "R1", "U1", "@Agent Link pair "+dev.DeviceID))
+	ft.next(t)
+	dev.poll(t) // online now, so mentions queue instead of being answered "offline"
+
+	sendEvent(t, base, mention(ft, "R1", "U1", "@Agent Link first"))
+	task := dev.poll(t)
+	ft.fails.Store(1)
+	ft.tries.Store(0)
+	if code := dev.result(t, dev.key, task.ID, "first answer"); code != http.StatusOK {
+		t.Fatalf("result after one 502: HTTP %d, want 200", code)
+	}
+	if p := ft.next(t); p.text != "first answer" || ft.tries.Load() != 2 {
+		t.Fatalf("posted %+v after %d tries, want the answer on the 2nd", p, ft.tries.Load())
+	}
+
+	sendEvent(t, base, mention(ft, "R1", "U1", "@Agent Link second"))
+	task = dev.poll(t)
+	ft.fails.Store(3) // every quick try; there is no room webhook to fall back to
+	ft.tries.Store(0)
+	if code := dev.result(t, dev.key, task.ID, "second answer"); code != http.StatusBadGateway {
+		t.Fatalf("result while Tanka is down: HTTP %d, want 502", code)
+	}
+	if n := ft.tries.Load(); n != 3 {
+		t.Fatalf("quick tries = %d, want 3", n)
+	}
+	if out := taskRow(t, s, task.ID).outcome; out != outReplyFailed {
+		t.Fatalf("outcome while Tanka is down = %q", out)
+	}
+	if p := ft.next(t); p.text != "second answer" {
+		t.Fatalf("later try posted %+v", p)
+	}
+	deadline := time.Now().Add(5 * time.Second)
+	for taskRow(t, s, task.ID).outcome != outPosted {
+		if time.Now().After(deadline) {
+			t.Fatalf("outcome after the later try = %q, want %q", taskRow(t, s, task.ID).outcome, outPosted)
+		}
+		time.Sleep(10 * time.Millisecond)
 	}
 }

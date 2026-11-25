@@ -123,7 +123,7 @@ func Post(ctx context.Context, c *http.Client, target string, m Message) error {
 	}
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, target, bytes.NewReader(body))
 	if err != nil {
-		return errors.New("tanka: invalid reply URL")
+		return errInvalidURL
 	}
 	req.Header.Set("Content-Type", "application/json")
 	resp, err := c.Do(req)
@@ -142,9 +142,35 @@ func Post(ctx context.Context, c *http.Client, target string, m Message) error {
 	raw, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
 	_ = json.Unmarshal(raw, &r)
 	if resp.StatusCode != http.StatusOK || r.Code != 0 {
-		return fmt.Errorf("tanka: post: HTTP %d code %d %s", resp.StatusCode, r.Code, r.Msg)
+		return &HTTPError{Status: resp.StatusCode, Code: r.Code, Msg: r.Msg}
 	}
 	return nil
+}
+
+var errInvalidURL = errors.New("tanka: invalid reply URL")
+
+// HTTPError is Tanka answering a post with anything but HTTP 200 and code 0.
+type HTTPError struct {
+	Status, Code int
+	Msg          string
+}
+
+func (e *HTTPError) Error() string {
+	return fmt.Sprintf("tanka: post: HTTP %d code %d %s", e.Status, e.Code, e.Msg)
+}
+
+// Retryable reports whether a failed Post may go through if sent again: Tanka answered 429
+// or 5xx, or the request got no answer at all. A refusal (another status, or a non-zero code
+// on HTTP 200) and a bad URL are final.
+func Retryable(err error) bool {
+	if err == nil || errors.Is(err, errInvalidURL) {
+		return false
+	}
+	var he *HTTPError
+	if errors.As(err, &he) {
+		return he.Status == http.StatusTooManyRequests || he.Status >= 500
+	}
+	return true
 }
 
 // Truncate cuts s to at most n runes, marking the cut.
