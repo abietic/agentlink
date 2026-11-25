@@ -147,6 +147,9 @@ type Server struct {
 	http *http.Client
 	now  func() time.Time
 
+	retryWait  time.Duration   // before a post's second try; the third waits twice as long
+	laterWaits []time.Duration // before each later try at a result Tanka would not take
+
 	mu      sync.Mutex
 	wake    map[string]chan struct{} // device → long-poll wakeup
 	waiting map[string][]*task       // device → tasks it has not taken yet, oldest first
@@ -201,17 +204,19 @@ func New(cfg Config) (*Server, error) {
 		log.Printf("vacuum: %v", err)
 	}
 	s := &Server{
-		cfg:     cfg,
-		bots:    map[string]*Bot{},
-		db:      db,
-		key:     key,
-		http:    &http.Client{Timeout: 15 * time.Second},
-		now:     time.Now,
-		wake:    map[string]chan struct{}{},
-		waiting: map[string][]*task{},
-		leased:  map[string]*task{},
-		seen:    map[string]time.Time{},
-		hops:    map[string]*botHops{},
+		cfg:        cfg,
+		bots:       map[string]*Bot{},
+		db:         db,
+		key:        key,
+		http:       &http.Client{Timeout: 15 * time.Second},
+		now:        time.Now,
+		retryWait:  2 * time.Second,
+		laterWaits: []time.Duration{time.Minute, 5 * time.Minute},
+		wake:       map[string]chan struct{}{},
+		waiting:    map[string][]*task{},
+		leased:     map[string]*task{},
+		seen:       map[string]time.Time{},
+		hops:       map[string]*botHops{},
 	}
 	for i := range s.cfg.Bots {
 		s.bots[s.cfg.Bots[i].Name] = &s.cfg.Bots[i]
@@ -830,7 +835,8 @@ func (s *Server) handleResult(w http.ResponseWriter, r *http.Request) {
 	if err := s.reply(s.bots[rt.Bot], rt.Room, rt.URL, res.Text, res.Theme, res.SessionID); err != nil {
 		log.Printf("task %s: reply failed: %v", id, err)
 		s.logDone(id, outReplyFailed, len(env.Sealed))
-		http.Error(w, "reply failed", http.StatusBadGateway)
+		s.replyLater(id, rt, res)
+		http.Error(w, "reply failed; the server tries again later", http.StatusBadGateway)
 		return
 	}
 	log.Printf("task %s done room=%s", id, rt.Room)
@@ -899,7 +905,9 @@ func (s *Server) reply(bot *Bot, roomID, responseURL, text, theme, session strin
 	}
 	start := s.now()
 	msg := tanka.Message{Text: tanka.Truncate(text, s.cfg.MaxReplyChars), TextType: "markdown", Theme: theme}
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	// Under the worker's 30 s for posting a result, retries included, so a slow Tanka does
+	// not make the worker send the result twice.
+	ctx, cancel := context.WithTimeout(context.Background(), 25*time.Second)
 	defer cancel()
 	var errs []error
 	switch {
@@ -907,7 +915,7 @@ func (s *Server) reply(bot *Bot, roomID, responseURL, text, theme, session strin
 	case !strings.HasPrefix(responseURL, s.cfg.ResponseURLPrefix):
 		errs = append(errs, errors.New("response_url does not start with response_url_prefix"))
 	default:
-		err := tanka.Post(ctx, s.http, responseURL, msg)
+		err := s.post(ctx, responseURL, msg)
 		if err == nil {
 			s.logPost(bot.Name, roomID, session, start, s.now())
 			return nil
@@ -918,11 +926,45 @@ func (s *Server) reply(bot *Bot, roomID, responseURL, text, theme, session strin
 	if hook == "" {
 		return errors.Join(append(errs, errors.New("no room webhook configured"))...)
 	}
-	if err := tanka.Post(ctx, s.http, hook, msg); err != nil {
+	if err := s.post(ctx, hook, msg); err != nil {
 		return errors.Join(append(errs, fmt.Errorf("room webhook: %w", err))...)
 	}
 	s.logPost(bot.Name, roomID, session, start, s.now())
 	return nil
+}
+
+// post sends m to target, and again after a short wait while the failure is one a later try
+// may get past (tanka.Retryable). It stops after three tries or when ctx ends.
+func (s *Server) post(ctx context.Context, target string, m tanka.Message) error {
+	for attempt := 1; ; attempt++ {
+		err := tanka.Post(ctx, s.http, target, m)
+		if err == nil || attempt == 3 || !tanka.Retryable(err) {
+			return err
+		}
+		select {
+		case <-ctx.Done():
+			return err
+		case <-time.After(time.Duration(attempt) * s.retryWait):
+		}
+	}
+}
+
+// replyLater posts a result Tanka would not take again after each of laterWaits, so a Tanka
+// outage of a few minutes does not lose an answer the device already worked out. The text is
+// held in memory only until then: a restart in between loses it.
+func (s *Server) replyLater(id string, rt *replyTo, res proto.Result) {
+	go func() {
+		for _, wait := range s.laterWaits {
+			time.Sleep(wait)
+			err := s.reply(s.bots[rt.Bot], rt.Room, rt.URL, res.Text, res.Theme, res.SessionID)
+			if err == nil {
+				log.Printf("task %s done room=%s (on a later try)", id, rt.Room)
+				s.logExec("posted later", `UPDATE task_log SET outcome = ? WHERE id = ? AND outcome = ?`, outPosted, id, outReplyFailed)
+				return
+			}
+			log.Printf("task %s: later reply failed: %v", id, err)
+		}
+	}()
 }
 
 func (s *Server) auth(r *http.Request) (*device, bool) {
