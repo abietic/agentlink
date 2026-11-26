@@ -349,7 +349,9 @@ func ledgerWorker(t *testing.T, rec Recovery) (w *Worker, asked *atomic.Int32, n
 	t.Cleanup(hs.Close)
 	f := newFixture(t)
 	f.cfg.ServerURL = hs.URL
-	f.cfg.Triggers = []Trigger{{Name: "alerts"}}
+	// These tests drive the ledger by hand and never finish a run, so the burst budget that a
+	// real run would hand back would only get in their way.
+	f.cfg.Triggers = []Trigger{{Name: "alerts", MaxPending: -1, MaxPerMin: -1}}
 	f.cfg.Recovery = map[string]Recovery{"trigger": rec}
 	if err := f.cfg.applyDefaults(); err != nil {
 		t.Fatal(err)

@@ -34,6 +34,13 @@ type Trigger struct {
 	EverySec  int      `json:"every_sec"`   // default 60
 	DedupeSec int      `json:"dedupe_sec"`  // a key that ran within this long is skipped; default 1800
 	MaxAgeSec int      `json:"max_age_sec"` // items older than this at first sight are skipped; default 3600
+	// MaxPending bounds how many of this trigger's tasks are admitted and not yet answered;
+	// MaxPerMin bounds how many it admits in any minute. Together they keep a burst (a rollout,
+	// a flapping monitor) from taking every lane the device has and burying people's prompts.
+	// Items over the bound are dropped, counted, and reported on the trigger's next reply.
+	// 0 takes the default; -1 removes that bound.
+	MaxPending int `json:"max_pending"` // default 2
+	MaxPerMin  int `json:"max_per_min"` // default 6
 	// Themes colors a reply by its content: the first line that starts with one of these
 	// labels (ignoring leading markdown emphasis) gets that Tanka theme. Longest label wins.
 	Themes map[string]string `json:"themes"`
@@ -48,6 +55,12 @@ type item struct {
 
 // marksKeep bounds how long dedupe marks are kept.
 const marksKeep = 7 * 24 * time.Hour
+
+// Defaults bound a trigger's burst, so a flood of alerts cannot take the device's lanes.
+const (
+	defaultMaxPending = 2 // tasks admitted and unanswered
+	defaultMaxPerMin  = 6 // tasks admitted per minute
+)
 
 func (c *Config) checkTriggers() error {
 	seen := map[string]bool{}
@@ -71,6 +84,15 @@ func (c *Config) checkTriggers() error {
 		tr.EverySec = defaultInt(tr.EverySec, 60)
 		tr.DedupeSec = defaultInt(tr.DedupeSec, 1800)
 		tr.MaxAgeSec = defaultInt(tr.MaxAgeSec, 3600)
+		if tr.MaxPending < -1 || tr.MaxPerMin < -1 {
+			return fmt.Errorf("trigger %s: max_pending and max_per_min are 0 (default) or -1 (no bound)", tr.Name)
+		}
+		if tr.MaxPending == 0 {
+			tr.MaxPending = defaultMaxPending
+		}
+		if tr.MaxPerMin == 0 {
+			tr.MaxPerMin = defaultMaxPerMin
+		}
 		for label, theme := range tr.Themes {
 			if label == "" || !slices.Contains(tanka.Themes, theme) {
 				return fmt.Errorf("trigger %s: themes[%q] = %q: label must be set and theme one of %v", tr.Name, label, theme, tanka.Themes)
@@ -132,11 +154,87 @@ func (w *Worker) admitTrigger(tr *Trigger, t proto.Task, retry bool) error {
 	if last, ok := w.marks[mark]; ok && !retry && t.Key != "" && w.now().Sub(last) < time.Duration(tr.DedupeSec)*time.Second {
 		return fmt.Errorf("key %s already ran at %s", t.Key, last.Local().Format("15:04"))
 	}
+	// The burst gate comes before the mark: an item it refuses is still marked, so the poll
+	// does not hand it back every minute, and counted, so the trigger's next reply says how
+	// many were dropped. Dropping is the point — a burst must not queue. A recovery retry is
+	// work already admitted before an interruption, so it is counted but never refused.
+	if err := w.burstLocked(tr); err != nil && !retry {
+		w.setMarkLocked(mark, w.now())
+		w.tgDrop[tr.Name]++
+		return err
+	}
 	w.setMarkLocked(mark, w.now())
+	w.tgLoad[tr.Name]++
 	if w.recovery(tr.Name) != nil {
 		w.trackLocked(t)
 	}
 	return nil
+}
+
+// burstLocked admits one task against tr's bounds, or says why not. Caller holds w.mu.
+func (w *Worker) burstLocked(tr *Trigger) error {
+	if tr.MaxPending > 0 && w.tgLoad[tr.Name] >= tr.MaxPending {
+		return fmt.Errorf("%d of its tasks are still unanswered", w.tgLoad[tr.Name])
+	}
+	if tr.MaxPerMin > 0 {
+		cut := w.now().Add(-time.Minute)
+		runs := w.tgRuns[tr.Name]
+		i := 0
+		for i < len(runs) && runs[i].Before(cut) {
+			i++
+		}
+		runs = append(runs[:0], runs[i:]...)
+		if len(runs) >= tr.MaxPerMin {
+			w.tgRuns[tr.Name] = runs
+			return fmt.Errorf("%d ran in the last minute", len(runs))
+		}
+		w.tgRuns[tr.Name] = append(runs, w.now())
+	}
+	return nil
+}
+
+// burstFull reports whether the trigger would refuse a task right now, without admitting one.
+// scan uses it to keep a burst from being submitted to the server at all.
+func (w *Worker) burstFull(tr *Trigger) bool {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	if tr.MaxPending > 0 && w.tgLoad[tr.Name] >= tr.MaxPending {
+		return true
+	}
+	if tr.MaxPerMin > 0 {
+		cut := w.now().Add(-time.Minute)
+		n := 0
+		for _, at := range w.tgRuns[tr.Name] {
+			if !at.Before(cut) {
+				n++
+			}
+		}
+		return n >= tr.MaxPerMin
+	}
+	return false
+}
+
+// triggerFinished gives back the slot a trigger task held and, when reply says something,
+// adds a note about items the trigger had to drop while it ran. Caller does not hold w.mu.
+func (w *Worker) triggerFinished(trigger, reply string) string {
+	w.mu.Lock()
+	if w.tgLoad[trigger] > 0 {
+		w.tgLoad[trigger]--
+	}
+	dropped := w.tgDrop[trigger]
+	if reply != "" {
+		w.tgDrop[trigger] = 0
+	}
+	w.mu.Unlock()
+	if dropped > 0 && reply != "" {
+		bounds := "the trigger's bounds"
+		if tr := w.trigger(trigger); tr != nil {
+			bounds = fmt.Sprintf("`max_pending` %d and `max_per_min` %d in worker.json", tr.MaxPending, tr.MaxPerMin)
+		}
+		reply += fmt.Sprintf("\n\n⚠️ While this ran, %d more `%s` item(s) arrived and were dropped: a trigger runs at most %s. They are not retried; raise those bounds if this was not a burst.",
+			dropped, trigger, bounds)
+	}
+	return reply
 }
 
 func (w *Worker) setMarkLocked(k string, at time.Time) {
@@ -196,6 +294,17 @@ func (w *Worker) scan(ctx context.Context, tr Trigger) error {
 		}
 		w.mu.Unlock()
 		if stale || (seen && !it.At.After(last)) {
+			continue
+		}
+		// A burst is dropped here, before it reaches the server: the queue it would fill is
+		// the one people's prompts wait in. Counted like an admission drop and reported on
+		// the trigger's next reply; marked seen so the poll does not offer it every minute.
+		if w.burstFull(&tr) {
+			w.mu.Lock()
+			w.setMarkLocked(mark, it.At)
+			w.tgDrop[tr.Name]++
+			w.mu.Unlock()
+			log.Printf("trigger %s: dropped %s: burst bounds are full", tr.Name, it.Key)
 			continue
 		}
 		if err := w.submit(ctx, tr.RoomID, tr.Name, it.Key, it.Text); err != nil {

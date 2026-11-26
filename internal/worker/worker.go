@@ -37,6 +37,11 @@ const (
 	queueSize     = 16 // waiting tasks per queue
 )
 
+// silentMarker as the whole of a triggered task's reply posts nothing. A trigger whose run
+// finds nothing worth saying answers with it, so routine alarms do not fill the room; an
+// error, a timeout or a denied tool call still posts.
+const silentMarker = "[[silent]]"
+
 type Session struct {
 	ID       string    `json:"id"`
 	Workdir  string    `json:"workdir"`
@@ -87,7 +92,8 @@ type Worker struct {
 	client  *Client
 	runners map[string]Runner // by harness name
 	store   *store
-	sem     chan struct{}
+	sem     chan struct{} // every run
+	tSem    chan struct{} // triggered runs only: one lane fewer, so a burst cannot take the last one
 	now     func() time.Time
 	wg      sync.WaitGroup
 	files   *http.Client        // downloads attachments
@@ -108,6 +114,12 @@ type Worker struct {
 	sessionOf map[string]string      // by task id: the session its last run left, sent with its result
 	claudeDir string                 // Claude Code's config directory, where it keeps session titles
 
+	// A trigger's burst budget, kept in memory: what it has admitted and not yet answered,
+	// what it admitted in the last minute, and what it dropped since it last said anything.
+	tgLoad map[string]int
+	tgRuns map[string][]time.Time
+	tgDrop map[string]int
+
 	runLogMu sync.Mutex
 }
 
@@ -122,6 +134,7 @@ func New(cfg Config) (*Worker, error) {
 		runners:   map[string]Runner{},
 		store:     st,
 		sem:       make(chan struct{}, cfg.MaxConcurrency),
+		tSem:      make(chan struct{}, triggerLane(cfg.MaxConcurrency)),
 		now:       time.Now,
 		queues:    map[string]*queue{},
 		running:   map[string]running{},
@@ -131,6 +144,9 @@ func New(cfg Config) (*Worker, error) {
 		pending:   map[string]*pendingRun{},
 		authDown:  map[string]bool{},
 		sessionOf: map[string]string{},
+		tgLoad:    map[string]int{},
+		tgRuns:    map[string][]time.Time{},
+		tgDrop:    map[string]int{},
 		claudeDir: claudeConfigDir(),
 		files:     attachmentClient,
 		fileOK:    tankaFile,
@@ -302,6 +318,9 @@ func (w *Worker) dispatch(ctx context.Context, t proto.Task) {
 		return
 	}
 	if !w.enqueue(ctx, w.queueKey(t), t) {
+		if t.Trigger != "" {
+			w.triggerFinished(t.Trigger, "") // it will not run, so its slot must go back
+		}
 		go w.send(t, fmt.Sprintf("%d tasks are already waiting for this session on this device; try again later.", queueSize))
 	}
 }
@@ -362,6 +381,39 @@ func (w *Worker) enqueue(ctx context.Context, key string, t proto.Task) bool {
 	return true
 }
 
+// triggerLane is how many triggered runs may go at once: one fewer than all runs, so however
+// many alerts arrive, a person's prompt always finds a free lane. With a single lane there is
+// nothing to reserve.
+func triggerLane(max int) int {
+	if max <= 1 {
+		return 1
+	}
+	return max - 1
+}
+
+// withLane runs f holding the lanes a task of its kind needs: every run takes a sem slot, and
+// a triggered run takes a tSem slot as well, so triggers together never hold the last sem
+// slot. It reports false if ctx ended before both lanes were free. A person's prompt waiting
+// for a sem slot is ahead of any trigger that comes later, since a channel's waiters are FIFO.
+func (w *Worker) withLane(ctx context.Context, t proto.Task, f func()) bool {
+	if t.Trigger != "" {
+		select {
+		case w.tSem <- struct{}{}:
+		case <-ctx.Done():
+			return false
+		}
+		defer func() { <-w.tSem }()
+	}
+	select {
+	case w.sem <- struct{}{}:
+	case <-ctx.Done():
+		return false
+	}
+	defer func() { <-w.sem }()
+	f()
+	return true
+}
+
 // drain runs one queue's tasks in order and exits once it is empty.
 func (w *Worker) drain(ctx context.Context, key string, q *queue) {
 	defer w.wg.Done()
@@ -377,15 +429,13 @@ func (w *Worker) drain(ctx context.Context, key string, q *queue) {
 		ran := false
 		reply := ""
 		if ctx.Err() == nil {
-			select {
-			case w.sem <- struct{}{}:
-				reply, ran = w.handle(ctx, t), true
-				<-w.sem
-			case <-ctx.Done():
-			}
+			ran = w.withLane(ctx, t, func() { reply = w.handle(ctx, t) })
 		}
 		if !ran {
 			reply = w.unrun(t)
+		}
+		if t.Trigger != "" {
+			reply = w.triggerFinished(t.Trigger, reply)
 		}
 		w.send(t, reply)
 		w.mu.Lock()
@@ -830,6 +880,9 @@ func (w *Worker) attempt(ctx context.Context, t proto.Task, run Run, current boo
 }
 
 func (w *Worker) format(ctx context.Context, t proto.Task, run Run, res RunResult, err error, skipped []string) string {
+	if t.Trigger != "" && err == nil && !res.IsError && !res.Stopped && !res.Stalled && res.Denials == 0 && strings.TrimSpace(res.Text) == silentMarker {
+		return ""
+	}
 	var b strings.Builder
 	switch {
 	case res.Stopped && ctx.Err() != nil:
