@@ -26,8 +26,24 @@ type Harness struct {
 
 	// Fallback names the harnesses that take a prompt, in order, while this one is at a
 	// usage limit or cannot start. A fallback starts a new session: one harness cannot
-	// continue another's.
+	// continue another's, unless it sets Resume.
 	Fallback []string `json:"fallback"`
+
+	// FallbackOn limits the fallback list to these usage limits, matched as a prefix of the
+	// harness's own name for the limit ("seven_day" covers seven_day and seven_day_opus, the
+	// scoped weekly windows). Empty falls back at any limit. A limit not listed here rests
+	// the harness and the prompt waits for the reset, as it does with no fallback at all:
+	// a short window is usually worth waiting out, and serving it elsewhere costs a session.
+	FallbackOn []string `json:"fallback_on"`
+
+	// Resume lets this harness continue the session the harness that just hit its limit was
+	// running, instead of starting a new one: the same Claude Code session — history, tools,
+	// working directory — with this harness's own model. Only an sdk harness can, because the
+	// transcript belongs to the CLI. When the limit was hit mid-run the session already holds
+	// the prompt, so the fallback is asked ResumePrompt instead; a limit that was already
+	// resting the primary never took the prompt, and the original one is sent.
+	Resume       bool   `json:"resume"`
+	ResumePrompt string `json:"resume_prompt"` // default defaultResumePrompt
 
 	// sdk: Runner and SDKOptions default to the config's top-level runner and sdk_options.
 	Runner     []string        `json:"runner"`
@@ -65,6 +81,9 @@ func (c *Config) checkHarnesses() error {
 			if len(h.Runner) == 0 {
 				h.Runner = c.Runner
 			}
+			if h.Resume {
+				h.ResumePrompt = cmp.Or(h.ResumePrompt, defaultResumePrompt)
+			}
 			if h.SDKOptions == nil {
 				h.SDKOptions = c.SDKOptions
 			}
@@ -91,6 +110,14 @@ func (c *Config) checkHarnesses() error {
 			}
 		default:
 			return fmt.Errorf(`harness %q: type must be "sdk", "mirasim" or "kimi"`, name)
+		}
+		if h.Resume && h.Type != "sdk" {
+			return fmt.Errorf(`harness %q: resume is only for an sdk harness; another type cannot continue a Claude Code session`, name)
+		}
+		for _, on := range h.FallbackOn {
+			if strings.TrimSpace(on) == "" {
+				return fmt.Errorf(`harness %q: fallback_on has an empty limit name`, name)
+			}
 		}
 		c.Harnesses[name] = h
 	}

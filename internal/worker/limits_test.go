@@ -236,3 +236,126 @@ func TestLimitWithoutFallback(t *testing.T) {
 		t.Fatalf("retry: %q, %d runs", r, lines(t, f.log))
 	}
 }
+
+// TestFallbackOnlyOnWeeklyLimit: fallback_on names the limits the fallback serves. A five-hour
+// limit is waited out on the harness itself — the fallback is not tried — and a weekly one is
+// moved, as before.
+func TestFallbackOnlyOnWeeklyLimit(t *testing.T) {
+	f := newFixture(t)
+	klog := filepath.Join(t.TempDir(), "kimi.log")
+	t.Setenv("AGENTLINK_STUB_KIMI", klog)
+	limit := filepath.Join(t.TempDir(), "limit.json")
+	t.Setenv("AGENTLINK_STUB_LIMIT", limit)
+	t.Setenv("AGENTLINK_STUB_LIMIT_ONCE", "1")
+	f.cfg.Harnesses = map[string]Harness{
+		"claude": {Type: "sdk", Fallback: []string{"kimi"}, FallbackOn: []string{"seven_day"}},
+		"kimi":   {Type: "kimi", Command: []string{os.Args[0]}},
+	}
+	if err := f.cfg.checkHarnesses(); err != nil {
+		t.Fatal(err)
+	}
+	w, err := New(f.cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	task := func(text string) string {
+		return w.handle(context.Background(), proto.Task{ID: "t", RoomID: "R1", UserID: "U1", Text: text})
+	}
+	if r := task("first"); !strings.HasPrefix(r, "echo: first") {
+		t.Fatalf("before the limit: %q", r)
+	}
+
+	// A five-hour limit: the room is told, kimi is not called, and the prompt waits.
+	five := time.Now().Add(2 * time.Hour).Truncate(time.Second)
+	os.WriteFile(limit, fmt.Appendf(nil, `{"type":"five_hour","resets_at":%d}`, five.Unix()), 0o600)
+	r := task("second")
+	if !strings.Contains(r, "5-hour limit (`five_hour`)") || strings.Contains(r, "run on `kimi`") {
+		t.Fatalf("five-hour notice: %q", r)
+	}
+	if lines(t, f.log) != 2 || lines(t, klog) != 0 {
+		t.Fatalf("five-hour limit fell back: %d sdk runs, %d kimi runs", lines(t, f.log), lines(t, klog))
+	}
+	// Still resting: a later message waits too, without a run.
+	if r := task("third"); !strings.Contains(r, "Nothing ran") || lines(t, f.log) != 2 {
+		t.Fatalf("while resting: %q, %d runs", r, lines(t, f.log))
+	}
+
+	// Past the five-hour reset a weekly limit is served by the fallback.
+	w.now = func() time.Time { return five.Add(time.Minute) }
+	week := five.Add(72 * time.Hour).Truncate(time.Second)
+	os.WriteFile(limit, fmt.Appendf(nil, `{"type":"seven_day","resets_at":%d}`, week.Unix()), 0o600)
+	// The five-hour notice was the only one, so this turn says nothing about the limit itself;
+	// what matters is that the fallback took it.
+	r = task("fourth")
+	if !strings.Contains(r, "`kimi` took this over") || !strings.Contains(r, "kimi: fourth") {
+		t.Fatalf("weekly limit: %q", r)
+	}
+	if lines(t, klog) != 1 {
+		t.Fatalf("kimi runs: %d", lines(t, klog))
+	}
+}
+
+// TestResumeFallbackKeepsTheSession: a fallback that sets resume continues the very session the
+// limited harness was running — same id, continued rather than re-sent — and a turn after that
+// goes back to the room's own harness on the same session once its limit lifts.
+func TestResumeFallbackKeepsTheSession(t *testing.T) {
+	f := newFixture(t)
+	limit := filepath.Join(t.TempDir(), "limit.json")
+	t.Setenv("AGENTLINK_STUB_LIMIT", limit)
+	t.Setenv("AGENTLINK_STUB_LIMIT_ONCE", "1")
+	f.cfg.Harnesses = map[string]Harness{
+		"claude":          {Type: "sdk", Fallback: []string{"claude-deepseek"}, FallbackOn: []string{"seven_day"}},
+		"claude-deepseek": {Type: "sdk", Resume: true, Runner: f.cfg.Runner},
+	}
+	if err := f.cfg.checkHarnesses(); err != nil {
+		t.Fatal(err)
+	}
+	w, err := New(f.cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	task := func(text string) string {
+		return w.handle(context.Background(), proto.Task{ID: "t", RoomID: "R1", UserID: "U1", Text: text})
+	}
+	if r := task("first"); !strings.HasPrefix(r, "echo: first") {
+		t.Fatalf("before the limit: %q", r)
+	}
+	claudeSession := w.state["R1"].SessionID
+
+	// The weekly limit lands mid-turn: the fallback continues the same session, asked to
+	// carry on rather than to read the prompt a second time.
+	reset := time.Now().Add(4 * 24 * time.Hour).Truncate(time.Second)
+	os.WriteFile(limit, fmt.Appendf(nil, `{"type":"seven_day","resets_at":%d}`, reset.Unix()), 0o600)
+	r := task("second")
+	if want := "echo: " + defaultResumePrompt; !strings.Contains(r, want) {
+		t.Fatalf("takeover: %q lacks %q", r, want)
+	}
+	req := f.last(t)
+	if !req.Resume || req.SessionID != claudeSession || req.Prompt != defaultResumePrompt {
+		t.Fatalf("takeover request: resume=%v session %q prompt %q", req.Resume, req.SessionID, req.Prompt)
+	}
+	// It only stood in: the session is still the room's harness's, and a later message goes to
+	// the fallback with the message itself, on the same session, because claude still rests.
+	if s, ok := sessionByID(w.state["R1"].Sessions, claudeSession); !ok || s.harness() != "claude" {
+		t.Fatalf("session harness: %+v", s)
+	}
+	r = task("third")
+	if !strings.Contains(r, "echo: third") {
+		t.Fatalf("while resting: %q", r)
+	}
+	if req := f.last(t); !req.Resume || req.SessionID != claudeSession || req.Prompt != "third" {
+		t.Fatalf("while resting request: resume=%v session %q prompt %q", req.Resume, req.SessionID, req.Prompt)
+	}
+
+	// After the reset the same session continues on claude again.
+	w.now = func() time.Time { return reset.Add(time.Minute) }
+	if r := task("fourth"); !strings.Contains(r, "echo: fourth") {
+		t.Fatalf("after the reset: %q", r)
+	}
+	if req := f.last(t); !req.Resume || req.SessionID != claudeSession || req.Prompt != "fourth" {
+		t.Fatalf("after the reset request: resume=%v session %q prompt %q", req.Resume, req.SessionID, req.Prompt)
+	}
+	if len(w.limits) != 0 {
+		t.Fatalf("limit kept: %+v", w.limits)
+	}
+}

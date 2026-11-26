@@ -31,6 +31,10 @@ worker 配置里的 `harnesses` 列出这台设备能用的执行方式，`harne
 
 每个 harness 都可以配 `fallback`（harness 名字的列表，按顺序）：它在用量上限里、或者根本起不来（没有返回会话）时，prompt 交给列表里下一个能用的。回退出来的是新会话，因为一个 harness 续接不了另一个的会话；这个新会话成为本群的当前会话，之后在它自己的 harness 上续接，`new` 才回到本群的 harness。
 
+- `fallback_on`：只在这些上限上回退，按 harness 报上来的上限名做前缀匹配（`"seven_day"` 覆盖 `seven_day` 和 `seven_day_opus`、`seven_day_sonnet` 这类周窗口）。不填就是任何上限都回退。没列出的上限照旧在本 harness 上等刷新——5 小时这种短窗口通常值得等，不值得为它换会话。
+- `resume`（只给 `sdk`）：回退时续接原 harness 正在跑的那个会话，而不是开新会话：同一个 Claude Code 会话（历史、工具、工作目录）换一个模型继续。上限是在这一轮中途撞上的，prompt 已经在会话记录里，回退收到的是 `resume_prompt`（默认“接着做，别重复已完成的工作”）；上限本来就让它休息、这一轮 prompt 根本没送出去时，回退收到的就是原 prompt。这个会话仍记在本群 harness 名下：它的上限解除后，同一个会话回到它身上续接，`new` 不是必须的。
+- 回退 harness 用什么模型由它自己的 `runner` 决定。例如给 Claude Code 换 DeepSeek 模型：写一个设了 `ANTHROPIC_MODEL=deepseek-flash` 的包装脚本，exec 原来的 runner，经 ClaudeRipple 把 `deepseek-flash` 路由到 DeepSeek；工具、账号、会话记录都还是 Claude Code 的。
+
 ### 用量上限
 
 - **Claude（`sdk`）**：runner 从 Agent SDK 的消息流里读 `rate_limit_event`（`status: rejected` 时带 `rateLimitType`：`five_hour`、`seven_day`、`seven_day_opus`、`seven_day_sonnet`、`overage` 等，和 `resetsAt`）；重试用完后 SDK 发出 `error: rate_limit` 的 assistant 消息，runner 就把这个上限交给 worker。

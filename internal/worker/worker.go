@@ -675,16 +675,30 @@ func (w *Worker) run(ctx context.Context, t proto.Task, run Run, current bool) (
 	var notes, resting []string // what to tell the room; harnesses at a limit
 	out := outcome{end: endLimit}
 	chain := w.chain(run.Harness)
+	promptTaken := false // the previous harness in the chain stopped at a limit, so the session has the prompt
 	for i, h := range chain {
 		r := run
 		if h != run.Harness {
-			r.Harness, r.Resume = h, false
+			hh := w.cfg.Harnesses[h]
+			r.Harness = h
+			// A fallback that resumes continues the same Claude Code session — same history,
+			// tools and working directory — with its own model. Only when the limited harness
+			// already took the prompt is it replaced by "continue"; a limit that was resting
+			// the primary before this turn never took it, and the original prompt is sent.
+			r.Resume = hh.Resume && run.SessionID != ""
+			if r.Resume && promptTaken {
+				r.Prompt = cmp.Or(hh.ResumePrompt, defaultResumePrompt)
+			}
 		}
+		promptTaken = false
 		w.mu.Lock()
 		l, limited := w.limitedLocked(h)
 		w.mu.Unlock()
 		if limited {
 			resting = append(resting, fmt.Sprintf("`%s` is at %s until %s", h, l, l.until()))
+			if !w.fallsBackOn(h, l) {
+				break // this limit is waited out here, not served elsewhere
+			}
 			continue
 		}
 		if !r.Resume {
@@ -694,7 +708,13 @@ func (w *Worker) run(ctx context.Context, t proto.Task, run Run, current bool) (
 		if handoff {
 			r.Prompt = r.Others + r.Prompt
 		}
-		res, err := w.attempt(ctx, t, r, current, text)
+		// A resumed fallback only stands in: the session is still the room's harness's, so a
+		// later turn goes back to it (resuming) once its limit lifts.
+		home := h
+		if r.Resume && h != run.Harness {
+			home = run.Harness
+		}
+		res, err := w.attempt(ctx, t, r, current, text, home)
 		out.ran = true
 		if res.SessionID != "" || res.Stopped || r.Resume {
 			out.session, out.harness = cmp.Or(res.SessionID, r.SessionID), h
@@ -707,6 +727,10 @@ func (w *Worker) run(ctx context.Context, t proto.Task, run Run, current bool) (
 			l, _ := w.limitedLocked(h)
 			w.mu.Unlock()
 			resting = append(resting, fmt.Sprintf("`%s` is at %s until %s", h, l, l.until()))
+			if !w.fallsBackOn(h, *res.Limit) {
+				break
+			}
+			promptTaken = true
 			continue
 		}
 		if err != nil && res.SessionID == "" && !res.Stopped && i < len(chain)-1 {
@@ -773,7 +797,7 @@ func joinNotes(notes []string, reply string) string {
 
 // attempt runs run on its harness and records the session it leaves in the room; with
 // current, that session becomes the room's current one.
-func (w *Worker) attempt(ctx context.Context, t proto.Task, run Run, current bool, text string) (RunResult, error) {
+func (w *Worker) attempt(ctx context.Context, t proto.Task, run Run, current bool, text, home string) (RunResult, error) {
 	defer w.lockSession(run.SessionID)()
 	w.mu.Lock()
 	w.running[t.ID] = running{room: t.RoomID, session: run.SessionID, since: w.now(), prompt: text}
@@ -790,7 +814,7 @@ func (w *Worker) attempt(ctx context.Context, t proto.Task, run Run, current boo
 		if current {
 			rs.SessionID = sid
 		}
-		rs.remember(Session{ID: sid, Workdir: run.Workdir, Title: preview(text, 40), LastUsed: w.now(), Harness: run.Harness})
+		rs.remember(Session{ID: sid, Workdir: run.Workdir, Title: preview(text, 40), LastUsed: w.now(), Harness: home})
 		w.saveLocked(t.RoomID)
 		w.sessionOf[t.ID] = sid
 	}

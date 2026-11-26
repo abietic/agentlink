@@ -110,6 +110,11 @@ func TestMain(m *testing.M) {
 			out := runReply{Type: "result", Text: "You've hit your limit", SessionID: req.SessionID, IsError: true}
 			json.Unmarshal(b, &out.RateLimit)
 			json.NewEncoder(os.Stdout).Encode(out)
+			// LIMIT_ONCE reports the limit to the first run only, so a run it falls back to
+			// in the same turn can answer.
+			if os.Getenv("AGENTLINK_STUB_LIMIT_ONCE") != "" {
+				os.Remove(os.Getenv("AGENTLINK_STUB_LIMIT"))
+			}
 			return
 		}
 		// Offered the room's other sessions, a message "handoff-to <id>" hands itself on.

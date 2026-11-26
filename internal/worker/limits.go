@@ -54,6 +54,23 @@ func (w *Worker) limitedLocked(h string) (Limit, bool) {
 	return l, ok && w.now().Before(l.ResetsAt)
 }
 
+// fallsBackOn says whether h's fallback list takes over at limit l. A harness with no
+// fallback_on falls back at any limit; one that lists limits (matched as a prefix, so
+// "seven_day" covers the scoped weekly windows) falls back only at those and waits out the
+// rest. An unnamed limit falls back only for a harness that listed none.
+func (w *Worker) fallsBackOn(h string, l Limit) bool {
+	on := w.cfg.Harnesses[h].FallbackOn
+	if len(on) == 0 {
+		return true
+	}
+	for _, p := range on {
+		if l.Name != "" && strings.HasPrefix(l.Name, p) {
+			return true
+		}
+	}
+	return false
+}
+
 // hitLimit records that h stopped at l and returns the notice to post, which is empty unless
 // this is the first time since h last finished a run without one.
 func (w *Worker) hitLimit(h string, l Limit) string {
@@ -69,6 +86,14 @@ func (w *Worker) hitLimit(h string, l Limit) string {
 	log.Printf("harness %s: at %s until %s (first=%v)", h, cmp.Or(l.Name, "an unnamed limit"), l.ResetsAt.Format(time.RFC3339), !again)
 	if again {
 		return ""
+	}
+	// A fallback serving this limit is where prompts go meanwhile; one that does not take
+	// this limit leaves them waiting, which the second sentence says.
+	if f := w.cfg.Harnesses[h].Fallback; len(f) > 0 && w.fallsBackOn(h, l) {
+		if known {
+			return fmt.Sprintf("⚠️ `%s` hit %s; it resets %s. Until then prompts here run on `%s`, and this is said only once.", h, l, l.until(), strings.Join(f, "`, `"))
+		}
+		return fmt.Sprintf("⚠️ `%s` hit %s and did not say when it resets; until this device asks it again after %s, prompts here run on `%s`.", h, l, l.until(), strings.Join(f, "`, `"))
 	}
 	if known {
 		return fmt.Sprintf("⚠️ `%s` hit %s; it resets %s. Until then this device does not run prompts on it, and says so only this once.", h, l, l.until())
