@@ -26,7 +26,7 @@ func TestRedactSecrets(t *testing.T) {
 		skToken   = "sk-abcdefghijklmnopqrstuvwxyz012345"
 		slackTok  = "xoxb-1234567890-abcdefghij"
 		sentryTok = "sntrys_abcdefghijklmnopqrstuvwxyz0123456789"
-		googleKey = "AIzaSyA1234567890abcdefghijklmnopqrstuv"
+		googleKey = "AIza" + "SyFAKEFAKEFAKEFAKEFAKEFAKEFAKEFAKE0" // split so secret scanners do not flag a fake key
 		jwt       = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.dozjgNryP4J3jVmNHl0w5N_XgL0n3I9PlFUP0THsR8U"
 		awsKey    = "AKIAIOSFODNN7EXAMPLE"
 	)
@@ -38,7 +38,7 @@ func TestRedactSecrets(t *testing.T) {
 		exact string // whole output, when it matters
 	}{
 		{name: "aws key id", in: "id " + awsKey + " end"},
-		{name: "aws temporary key", in: "ASIAY34FZKBOKMUTVV7A"},
+		{name: "aws temporary key", in: "ASIA" + "FAKEFAKEFAKEFAKE"},
 		{name: "pem block", in: pemBlock, exact: redacted},
 		{name: "unterminated pem", in: "before\n-----BEGIN OPENSSH PRIVATE KEY-----\nb3BlbnNzaC1rZXk\n", exact: "before\n" + redacted},
 		{name: "github token", in: ghToken},
