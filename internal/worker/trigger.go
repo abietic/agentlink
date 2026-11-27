@@ -37,7 +37,8 @@ type Trigger struct {
 	// MaxPending bounds how many of this trigger's tasks are admitted and not yet answered;
 	// MaxPerMin bounds how many it admits in any minute. Together they keep a burst (a rollout,
 	// a flapping monitor) from taking every lane the device has and burying people's prompts.
-	// Items over the bound are dropped, counted, and reported on the trigger's next reply.
+	// scan holds items over the bound until there is room; those that leave its list or go
+	// stale first are counted and reported on the trigger's next reply and in the digest.
 	// 0 takes the default; -1 removes that bound.
 	MaxPending int `json:"max_pending"` // default 2
 	MaxPerMin  int `json:"max_per_min"` // default 6
@@ -51,6 +52,9 @@ type item struct {
 	Key  string    `json:"key"`
 	At   time.Time `json:"at"`
 	Text string    `json:"text"`
+	// Skip, when set, says why the command chose not to raise this item (it is resolved, say).
+	// It is not run; it is marked seen and, with a digest, listed there with this reason.
+	Skip string `json:"skip,omitempty"`
 }
 
 // marksKeep bounds how long dedupe marks are kept.
@@ -68,6 +72,9 @@ func (c *Config) checkTriggers() error {
 		tr := &c.Triggers[i]
 		if tr.Name == "" || seen[tr.Name] {
 			return fmt.Errorf("triggers[%d]: name must be set and unique", i)
+		}
+		if tr.Name == digestTrigger {
+			return fmt.Errorf("triggers[%d]: %q is the suppression digest's name", i, digestTrigger)
 		}
 		seen[tr.Name] = true
 		if len(tr.Command) > 0 && tr.RoomID == "" {
@@ -161,6 +168,7 @@ func (w *Worker) admitTrigger(tr *Trigger, t proto.Task, retry bool) error {
 	if err := w.burstLocked(tr); err != nil && !retry {
 		w.setMarkLocked(mark, w.now())
 		w.tgDrop[tr.Name]++
+		w.suppressLocked(tr.Name, t.Key, whyBurst, t.Text)
 		return err
 	}
 	w.setMarkLocked(mark, w.now())
@@ -307,21 +315,31 @@ func (w *Worker) scan(ctx context.Context, tr Trigger) error {
 		stale := !seen && w.now().Sub(it.At) > time.Duration(tr.MaxAgeSec)*time.Second
 		if stale {
 			w.setMarkLocked(mark, it.At)
-			w.unwaitLocked(tr.Name, it.Key, "it went stale")
+			if !w.unwaitLocked(tr.Name, it.Key, "went stale") && it.Skip == "" {
+				w.suppressLocked(tr.Name, it.Key, whyStale, it.Text)
+			}
+		}
+		fresh := !stale && (!seen || it.At.After(last))
+		if fresh && it.Skip != "" {
+			w.setMarkLocked(mark, it.At)
+			w.unwaitLocked(tr.Name, it.Key, "")
+			w.suppressLocked(tr.Name, it.Key, fmt.Sprintf(whySkip, it.Skip), it.Text)
+			fresh = false
 		}
 		w.mu.Unlock()
-		if stale || (seen && !it.At.After(last)) {
+		if !fresh {
 			continue
 		}
 		if room == 0 {
 			w.mu.Lock()
 			waits := w.tgWait[tr.Name]
 			if waits == nil {
-				waits = map[string]bool{}
+				waits = map[string]string{}
 				w.tgWait[tr.Name] = waits
 			}
-			first := !waits[it.Key]
-			waits[it.Key] = true
+			_, held := waits[it.Key]
+			first := !held
+			waits[it.Key] = it.Text
 			w.mu.Unlock()
 			if first {
 				log.Printf("trigger %s: holding %s: the trigger is at its bounds", tr.Name, it.Key)
@@ -346,21 +364,28 @@ func (w *Worker) scan(ctx context.Context, tr Trigger) error {
 	w.mu.Lock()
 	for k := range w.tgWait[tr.Name] {
 		if !listed[k] {
-			w.unwaitLocked(tr.Name, k, "it left the list")
+			w.unwaitLocked(tr.Name, k, "left the list")
 		}
 	}
 	w.mu.Unlock()
 	return nil
 }
 
-// unwaitLocked gives up on a held item: it is counted as dropped. Caller holds w.mu.
-func (w *Worker) unwaitLocked(trigger, key, why string) {
-	if !w.tgWait[trigger][key] {
-		return
+// unwaitLocked gives up on a held item, saying why: it is counted as dropped and recorded for
+// the digest. An empty why only forgets it. Reports whether the item was held. Caller holds w.mu.
+func (w *Worker) unwaitLocked(trigger, key, why string) bool {
+	text, held := w.tgWait[trigger][key]
+	if !held {
+		return false
 	}
 	delete(w.tgWait[trigger], key)
+	if why == "" {
+		return true
+	}
 	w.tgDrop[trigger]++
-	log.Printf("trigger %s: dropped %s: %s before there was room", trigger, key, why)
+	w.suppressLocked(trigger, key, fmt.Sprintf(whyHeld, why), text)
+	log.Printf("trigger %s: dropped %s: it %s before there was room", trigger, key, why)
+	return true
 }
 
 // submit asks the server to queue a triggered task for roomID.

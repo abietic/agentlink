@@ -119,7 +119,8 @@ type Worker struct {
 	tgLoad map[string]int
 	tgRuns map[string][]time.Time
 	tgDrop map[string]int
-	tgWait map[string]map[string]bool // items scan holds back while the trigger is at its bounds
+	tgWait map[string]map[string]string // items scan holds back while the trigger is at its bounds: key → text
+	supp   suppressedLog                // trigger items not triaged since the last digest
 
 	runLogMu sync.Mutex
 }
@@ -148,7 +149,7 @@ func New(cfg Config) (*Worker, error) {
 		tgLoad:    map[string]int{},
 		tgRuns:    map[string][]time.Time{},
 		tgDrop:    map[string]int{},
-		tgWait:    map[string]map[string]bool{},
+		tgWait:    map[string]map[string]string{},
 		claudeDir: claudeConfigDir(),
 		files:     attachmentClient,
 		fileOK:    tankaFile,
@@ -166,6 +167,9 @@ func New(cfg Config) (*Worker, error) {
 		return nil, err
 	}
 	if _, err := st.get("pending", &w.pending); err != nil {
+		return nil, err
+	}
+	if _, err := st.get("suppressed", &w.supp); err != nil {
 		return nil, err
 	}
 	if err := pruneRunLog(w.runLogPath(), w.now()); err != nil {
@@ -236,6 +240,10 @@ func (w *Worker) Run(ctx context.Context) error {
 			go w.watch(ctx, tr)
 		}
 	}
+	if w.cfg.Digest != nil {
+		w.wg.Add(1)
+		go w.digestLoop(ctx)
+	}
 	backoff := time.Second
 	var err error
 	for ctx.Err() == nil {
@@ -296,6 +304,18 @@ func (w *Worker) status() proto.WorkerStatus {
 }
 
 func (w *Worker) dispatch(ctx context.Context, t proto.Task) {
+	if t.Trigger == digestTrigger {
+		// The worker's own digest, back from the server: post it as it is, with no run. Only
+		// to the digest's room, so a digest cannot be pointed anywhere else.
+		text := ""
+		if d := w.cfg.Digest; d != nil && t.RoomID == d.RoomID {
+			text = t.Text
+		} else {
+			log.Printf("task %s: a digest for room %s, which is not the digest's room", t.ID, t.RoomID)
+		}
+		go w.post(t, text)
+		return
+	}
 	if t.Trigger != "" {
 		err := w.claimOrAdmit(t)
 		if err == errAnswered {
@@ -884,6 +904,7 @@ func (w *Worker) attempt(ctx context.Context, t proto.Task, run Run, current boo
 func (w *Worker) format(ctx context.Context, t proto.Task, run Run, res RunResult, err error, skipped []string) string {
 	if t.Trigger != "" && strings.TrimSpace(res.Text) == silentMarker {
 		if err == nil && !res.IsError && !res.Stopped && !res.Stalled && res.Denials == 0 {
+			w.suppress(t.Trigger, t.Key, whySilent, t.Text)
 			return ""
 		}
 		// Something still has to be said (a denial, an error), but the marker is not for

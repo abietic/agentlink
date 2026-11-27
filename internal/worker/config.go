@@ -56,6 +56,8 @@ type Config struct {
 	Triggers []Trigger `json:"triggers"` // see Trigger
 	// Recovery says, per task source, what happens when a run ends early; see Recovery.
 	Recovery map[string]Recovery `json:"recovery"`
+	// Digest posts the trigger items that were not triaged, so wrong drops are seen; see Digest.
+	Digest *Digest `json:"digest"`
 }
 
 func LoadConfig(path string) (Config, error) {
@@ -118,6 +120,9 @@ func (c *Config) applyDefaults() error {
 		return errors.New("stall_sec must be 0 or below timeout_sec")
 	}
 	if err := c.checkTriggers(); err != nil {
+		return err
+	}
+	if err := c.checkDigest(); err != nil {
 		return err
 	}
 	return c.checkRecovery()

@@ -120,6 +120,7 @@ mirasim 的几点限制：
 - 防饿死：触发任务合计只能同时占用 `max_concurrency - 1` 个槽（`max_concurrency` 为 1 时不保留），所以告警再多也只会占这一个槽，剩下的槽留给人的 prompt。
 - 防 DoS：每个 trigger 有 `max_pending`（默认 2，已接单还没回帖的任务数）和 `max_per_min`（默认 6，每分钟最多接单）两个上限。一次轮询最多只提交上限还容得下的条数，其余条目不标记已见、留在原地等：之后的轮询只要还列着它，有空位时就提交。等待中的条目如果从轮询输出里消失或超过 `max_age_sec`，计为「未处理」；server 推来的或并发挤进来的超额任务在接单时直接丢弃，也计入。未处理数在该 trigger 下一次回帖末尾报告一次（`⚠️ N … item(s) were not run …`），本来要静默的回帖也会因此发出这一句。`0` 取默认，`-1` 取消该上限。实例：告警风暴时该 trigger 最多压住两三单，不会把队列灌满，暂时排不上的告警等空位而不是丢掉。
 - 静默回帖：触发任务的回复如果整段只有 `[[silent]]`（前后空白不算），worker 不回帖。用来让「看了但没变化」的例行巡检不刷屏；报错、超时、被拒的工具调用仍会回帖，此时正文换成 `Nothing new to report.`，不会把 `[[silent]]` 原样发出去。
+- 抑制汇总（`digest`，可选）：配了 `"digest": {"room_id": "…", "every_sec": 3600}` 后，worker 记下每一条没有分诊的 trigger 条目和原因：初次看到时已超过 `max_age_sec`、等空位时离开列表或过期、接单时超出突发上限、模型回了 `[[silent]]`、轮询命令自己标了 `skip`（条目里加 `"skip": "原因"`，比如已 resolved）。每隔 `every_sec`（默认 3600，最少 60）有内容时，把这些按 trigger 和原因分组，发到 `room_id` 指定的群，用来发现被误删的告警。汇总通过 server 的 trigger 通道走一圈，回到本机后原样发出、不跑模型，只发到 `room_id` 这个群；server 暂时不可用时记录保留到下一次。记录存在 `worker.db`，重启不丢；两次汇总之间超过 500 条后只计数。没配 `digest` 时什么都不记。trigger 不能叫 `digest`。
 - 结果没有 `response_url`，只能发到群的 incoming webhook，所以该群必须配 `room_webhooks`。空结果不发；排队超时的触发任务静默丢弃。
 - 回帖底色：`triggers[].themes` 是「标签 → Tanka theme」表，例如 `{"【需处理】": "important", "【跟进中】": "idea"}`。回帖里第一行以某个标签开头（忽略行首的 `**` / `_`）的，整条消息用对应的 theme；同一行匹配多个标签取最长的，都不匹配就是白底。theme 只能是 `idea`（黄）、`important`（红）、`celebration`（绿）、`announcement`（蓝），写错启动时报错。标签由触发任务自己的提示词约定，worker 不认识具体业务。
 - server 的 `rooms`（群 id → device id）在启动时写入绑定，触发用的群不必有人去发 `pair`。
