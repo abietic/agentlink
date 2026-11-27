@@ -76,7 +76,7 @@ func TestTriggerBurstIsBounded(t *testing.T) {
 	if err := w.admit(proto.Task{Trigger: "alerts", Key: "a"}); err != nil {
 		t.Fatal(err)
 	}
-	if !w.burstFull(&w.cfg.Triggers[0]) {
+	if w.burstRoom(&w.cfg.Triggers[0]) != 0 {
 		t.Fatal("scan would submit while the trigger is full")
 	}
 	for _, k := range []string{"b", "c"} {
@@ -88,25 +88,25 @@ func TestTriggerBurstIsBounded(t *testing.T) {
 	if err := w.admit(proto.Task{Trigger: "alerts", Key: "b"}); err == nil {
 		t.Fatal("a dropped item was admitted on the next poll")
 	}
-	reply := w.triggerFinished("alerts", "【无需处理】nothing new")
-	if !strings.Contains(reply, "2 more `alerts` item(s) arrived and were dropped") || !strings.Contains(reply, "`max_pending` 1") {
+	reply := w.triggerFinished("alerts", "【无需处理】nothing new", true)
+	if !strings.Contains(reply, "2 `alerts` item(s) were not run") || !strings.Contains(reply, "`max_pending` 1") {
 		t.Fatalf("reply: %q", reply)
 	}
-	if w.triggerFinished("alerts", "again") != "again" {
+	if w.triggerFinished("alerts", "again", true) != "again" {
 		t.Fatal("the dropped count was reported twice")
 	}
-	// An empty reply keeps the count for the next one.
+	// A reply that is not posted keeps the count; a silent one is broken by it.
 	if err := w.admit(proto.Task{Trigger: "alerts", Key: "d"}); err != nil {
 		t.Fatal(err)
 	}
 	if err := w.admit(proto.Task{Trigger: "alerts", Key: "e"}); err == nil {
 		t.Fatal("the count for the admitted task was not released")
 	}
-	if w.triggerFinished("alerts", "") != "" {
-		t.Fatal("an empty reply gained a note")
+	if w.triggerFinished("alerts", "", false) != "" {
+		t.Fatal("a reply that is not posted gained a note")
 	}
-	if got := w.triggerFinished("alerts", "later"); !strings.Contains(got, "1 more") {
-		t.Fatalf("empty reply consumed the count: %q", got)
+	if got := w.triggerFinished("alerts", "", true); !strings.HasPrefix(got, "⚠️ 1 `alerts` item(s) were not run") {
+		t.Fatalf("a silent reply hid the drops: %q", got)
 	}
 }
 
@@ -208,8 +208,8 @@ func TestSilentReply(t *testing.T) {
 	if got := w.format(context.Background(), tr, run, RunResult{Text: "[[silent]]", IsError: true}, nil, nil); got == "" {
 		t.Fatal("an error was swallowed by the silent marker")
 	}
-	if got := w.format(context.Background(), tr, run, RunResult{Text: "[[silent]]", Denials: 1}, nil, nil); got == "" {
-		t.Fatal("a denied tool call was swallowed by the silent marker")
+	if got := w.format(context.Background(), tr, run, RunResult{Text: "[[silent]]", Denials: 1}, nil, nil); got == "" || strings.Contains(got, silentMarker) || !strings.Contains(got, "Nothing new to report.") || !strings.Contains(got, "1 tool call(s) were denied") {
+		t.Fatalf("a denied tool call with the silent marker posted %q", got)
 	}
 	if got := w.format(context.Background(), proto.Task{ID: "t2", RoomID: "R1", Text: "hi"}, run, RunResult{Text: "[[silent]]"}, nil, nil); got == "" {
 		t.Fatal("a person's prompt was swallowed by the silent marker")
@@ -450,4 +450,67 @@ func TestScanQueuesEachItemOnce(t *testing.T) {
 	scan(worker(), 1) // seen marks survive a restart
 	write(now)
 	scan(w, 2)
+}
+
+// TestScanHoldsABurst checks that scan submits only what the trigger's bounds have room for,
+// keeps the rest unmarked so a later poll queues them, and counts the ones that leave the list
+// before there was room.
+func TestScanHoldsABurst(t *testing.T) {
+	var queued atomic.Int32
+	hs := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		queued.Add(1)
+		fmt.Fprint(w, `{"id":"x"}`)
+	}))
+	defer hs.Close()
+	f := newFixture(t)
+	items := filepath.Join(t.TempDir(), "items.jsonl")
+	now := time.Now()
+	write := func(keys ...string) {
+		var b []byte
+		for _, k := range keys {
+			l, _ := json.Marshal(item{Key: k, At: now.Add(-time.Minute), Text: "triage " + k})
+			b = append(append(b, l...), '\n')
+		}
+		os.WriteFile(items, b, 0o600)
+	}
+	f.cfg.ServerURL = hs.URL
+	f.cfg.Triggers = []Trigger{{Name: "alerts", RoomID: "R1", Command: []string{"cat", items}, MaxPending: 2, MaxPerMin: -1}}
+	if err := f.cfg.checkTriggers(); err != nil {
+		t.Fatal(err)
+	}
+	w, err := New(f.cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	w.setIdentity(Identity{DeviceID: "d", DeviceKey: seal.NewPrivateKey().Bytes(), ServerKey: seal.NewPrivateKey().PublicKey().Bytes()})
+	scan := func(want int32) {
+		t.Helper()
+		if err := w.scan(context.Background(), w.cfg.Triggers[0]); err != nil {
+			t.Fatal(err)
+		}
+		if got := queued.Load(); got != want {
+			t.Fatalf("queued %d, want %d", got, want)
+		}
+	}
+
+	write("a", "b", "c", "d", "e")
+	scan(2) // one scan never submits past the bounds, though nothing is admitted yet
+	for _, k := range []string{"a", "b"} {
+		if err := w.admit(proto.Task{Trigger: "alerts", Key: k}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	scan(2) // full: c, d and e wait
+	w.triggerFinished("alerts", "done a", true)
+	scan(3) // room for one: c
+	if err := w.admit(proto.Task{Trigger: "alerts", Key: "c"}); err != nil {
+		t.Fatal(err)
+	}
+	write("d") // e left the list while it waited
+	scan(3)
+	if got := w.triggerFinished("alerts", "done b", true); !strings.Contains(got, "1 `alerts` item(s) were not run") {
+		t.Fatalf("the item that left the list was not reported: %q", got)
+	}
+	scan(4) // d waited and is queued now
+	scan(4)
 }

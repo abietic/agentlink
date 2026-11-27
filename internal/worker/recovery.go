@@ -405,12 +405,16 @@ func (w *Worker) adopt() {
 	w.mu.Lock()
 	defer w.mu.Unlock()
 	for k, e := range w.pending {
-		if e.State != "queued" && e.State != "running" {
-			continue
-		}
+		// An entry whose source lost its recovery config is dropped whatever its state:
+		// without a config nothing retries it, and one kept would come back the day a
+		// config does — every task an emergency stopped, asked for again at once.
 		pol := w.recovery(e.Trigger)
 		if pol == nil {
+			log.Printf("recovery: dropping %s: its source has no recovery config any more", k)
 			delete(w.pending, k)
+			continue
+		}
+		if e.State != "queued" && e.State != "running" {
 			continue
 		}
 		if e.State == "running" {

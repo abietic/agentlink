@@ -119,6 +119,7 @@ type Worker struct {
 	tgLoad map[string]int
 	tgRuns map[string][]time.Time
 	tgDrop map[string]int
+	tgWait map[string]map[string]bool // items scan holds back while the trigger is at its bounds
 
 	runLogMu sync.Mutex
 }
@@ -147,6 +148,7 @@ func New(cfg Config) (*Worker, error) {
 		tgLoad:    map[string]int{},
 		tgRuns:    map[string][]time.Time{},
 		tgDrop:    map[string]int{},
+		tgWait:    map[string]map[string]bool{},
 		claudeDir: claudeConfigDir(),
 		files:     attachmentClient,
 		fileOK:    tankaFile,
@@ -319,7 +321,7 @@ func (w *Worker) dispatch(ctx context.Context, t proto.Task) {
 	}
 	if !w.enqueue(ctx, w.queueKey(t), t) {
 		if t.Trigger != "" {
-			w.triggerFinished(t.Trigger, "") // it will not run, so its slot must go back
+			w.triggerFinished(t.Trigger, "", false) // it will not run, so its slot must go back
 		}
 		go w.send(t, fmt.Sprintf("%d tasks are already waiting for this session on this device; try again later.", queueSize))
 	}
@@ -435,7 +437,7 @@ func (w *Worker) drain(ctx context.Context, key string, q *queue) {
 			reply = w.unrun(t)
 		}
 		if t.Trigger != "" {
-			reply = w.triggerFinished(t.Trigger, reply)
+			reply = w.triggerFinished(t.Trigger, reply, true)
 		}
 		w.send(t, reply)
 		w.mu.Lock()
@@ -880,8 +882,13 @@ func (w *Worker) attempt(ctx context.Context, t proto.Task, run Run, current boo
 }
 
 func (w *Worker) format(ctx context.Context, t proto.Task, run Run, res RunResult, err error, skipped []string) string {
-	if t.Trigger != "" && err == nil && !res.IsError && !res.Stopped && !res.Stalled && res.Denials == 0 && strings.TrimSpace(res.Text) == silentMarker {
-		return ""
+	if t.Trigger != "" && strings.TrimSpace(res.Text) == silentMarker {
+		if err == nil && !res.IsError && !res.Stopped && !res.Stalled && res.Denials == 0 {
+			return ""
+		}
+		// Something still has to be said (a denial, an error), but the marker is not for
+		// people: the run found nothing new, so the body says that.
+		res.Text = "Nothing new to report."
 	}
 	var b strings.Builder
 	switch {

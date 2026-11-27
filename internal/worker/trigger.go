@@ -193,13 +193,15 @@ func (w *Worker) burstLocked(tr *Trigger) error {
 	return nil
 }
 
-// burstFull reports whether the trigger would refuse a task right now, without admitting one.
-// scan uses it to keep a burst from being submitted to the server at all.
-func (w *Worker) burstFull(tr *Trigger) bool {
+// burstRoom says how many more tasks tr may start right now without admitting any: -1 when
+// nothing bounds it. scan spends it item by item, because the tasks it submits are admitted
+// only after a server round trip and would all see the same free slot.
+func (w *Worker) burstRoom(tr *Trigger) int {
 	w.mu.Lock()
 	defer w.mu.Unlock()
-	if tr.MaxPending > 0 && w.tgLoad[tr.Name] >= tr.MaxPending {
-		return true
+	room := -1
+	if tr.MaxPending > 0 {
+		room = max(0, tr.MaxPending-w.tgLoad[tr.Name])
 	}
 	if tr.MaxPerMin > 0 {
 		cut := w.now().Add(-time.Minute)
@@ -209,32 +211,40 @@ func (w *Worker) burstFull(tr *Trigger) bool {
 				n++
 			}
 		}
-		return n >= tr.MaxPerMin
+		if r := max(0, tr.MaxPerMin-n); room < 0 || r < room {
+			room = r
+		}
 	}
-	return false
+	return room
 }
 
-// triggerFinished gives back the slot a trigger task held and, when reply says something,
-// adds a note about items the trigger had to drop while it ran. Caller does not hold w.mu.
-func (w *Worker) triggerFinished(trigger, reply string) string {
+// triggerFinished gives back the slot a trigger task held. When the task's reply will be
+// posted (posts), it adds a note about items the trigger did not run; a silent reply ("")
+// is broken by that note, because people must hear that alerts went unexamined. Caller does
+// not hold w.mu.
+func (w *Worker) triggerFinished(trigger, reply string, posts bool) string {
 	w.mu.Lock()
 	if w.tgLoad[trigger] > 0 {
 		w.tgLoad[trigger]--
 	}
 	dropped := w.tgDrop[trigger]
-	if reply != "" {
+	if posts {
 		w.tgDrop[trigger] = 0
 	}
 	w.mu.Unlock()
-	if dropped > 0 && reply != "" {
-		bounds := "the trigger's bounds"
-		if tr := w.trigger(trigger); tr != nil {
-			bounds = fmt.Sprintf("`max_pending` %d and `max_per_min` %d in worker.json", tr.MaxPending, tr.MaxPerMin)
-		}
-		reply += fmt.Sprintf("\n\n⚠️ While this ran, %d more `%s` item(s) arrived and were dropped: a trigger runs at most %s. They are not retried; raise those bounds if this was not a burst.",
-			dropped, trigger, bounds)
+	if dropped == 0 || !posts {
+		return reply
 	}
-	return reply
+	bounds := "the trigger's bounds"
+	if tr := w.trigger(trigger); tr != nil {
+		bounds = fmt.Sprintf("`max_pending` %d and `max_per_min` %d in worker.json", tr.MaxPending, tr.MaxPerMin)
+	}
+	note := fmt.Sprintf("⚠️ %d `%s` item(s) were not run: the trigger was at its bounds (%s) until they left its list or went stale. Raise those bounds if this was not a burst.",
+		dropped, trigger, bounds)
+	if reply == "" {
+		return note
+	}
+	return reply + "\n\n" + note
 }
 
 func (w *Worker) setMarkLocked(k string, at time.Time) {
@@ -266,7 +276,10 @@ func (w *Worker) watch(ctx context.Context, tr Trigger) {
 	}
 }
 
-// scan runs tr's command once and queues the items it has not seen yet.
+// scan runs tr's command once and queues the items it has not seen yet. It submits no more
+// than the trigger's bounds have room for; the rest wait unmarked, so a later poll that still
+// lists them queues them once there is room. One that leaves the list or goes stale first is
+// counted as dropped and reported on the trigger's next reply.
 func (w *Worker) scan(ctx context.Context, tr Trigger) error {
 	cctx, cancel := context.WithTimeout(ctx, 2*time.Minute)
 	defer cancel()
@@ -277,6 +290,8 @@ func (w *Worker) scan(ctx context.Context, tr Trigger) error {
 	if err != nil {
 		return fmt.Errorf("command: %v: %s", err, bytes.TrimSpace(stderr.Bytes()[:min(stderr.Len(), 300)]))
 	}
+	room := w.burstRoom(&tr)
+	listed := map[string]bool{}
 	sc := bufio.NewScanner(bytes.NewReader(out))
 	sc.Buffer(nil, 1<<20)
 	for sc.Scan() {
@@ -285,37 +300,67 @@ func (w *Worker) scan(ctx context.Context, tr Trigger) error {
 			log.Printf("trigger %s: skipping a line that is not {key, at, text}", tr.Name)
 			continue
 		}
+		listed[it.Key] = true
 		mark := "seen/" + tr.Name + "/" + it.Key
 		w.mu.Lock()
 		last, seen := w.marks[mark]
 		stale := !seen && w.now().Sub(it.At) > time.Duration(tr.MaxAgeSec)*time.Second
 		if stale {
 			w.setMarkLocked(mark, it.At)
+			w.unwaitLocked(tr.Name, it.Key, "it went stale")
 		}
 		w.mu.Unlock()
 		if stale || (seen && !it.At.After(last)) {
 			continue
 		}
-		// A burst is dropped here, before it reaches the server: the queue it would fill is
-		// the one people's prompts wait in. Counted like an admission drop and reported on
-		// the trigger's next reply; marked seen so the poll does not offer it every minute.
-		if w.burstFull(&tr) {
+		if room == 0 {
 			w.mu.Lock()
-			w.setMarkLocked(mark, it.At)
-			w.tgDrop[tr.Name]++
+			waits := w.tgWait[tr.Name]
+			if waits == nil {
+				waits = map[string]bool{}
+				w.tgWait[tr.Name] = waits
+			}
+			first := !waits[it.Key]
+			waits[it.Key] = true
 			w.mu.Unlock()
-			log.Printf("trigger %s: dropped %s: burst bounds are full", tr.Name, it.Key)
+			if first {
+				log.Printf("trigger %s: holding %s: the trigger is at its bounds", tr.Name, it.Key)
+			}
 			continue
 		}
 		if err := w.submit(ctx, tr.RoomID, tr.Name, it.Key, it.Text); err != nil {
 			return fmt.Errorf("queue %s: %w", it.Key, err)
 		}
+		if room > 0 {
+			room--
+		}
 		log.Printf("trigger %s: queued %s", tr.Name, it.Key)
 		w.mu.Lock()
 		w.setMarkLocked(mark, it.At)
+		delete(w.tgWait[tr.Name], it.Key)
 		w.mu.Unlock()
 	}
-	return sc.Err()
+	if err := sc.Err(); err != nil {
+		return err
+	}
+	w.mu.Lock()
+	for k := range w.tgWait[tr.Name] {
+		if !listed[k] {
+			w.unwaitLocked(tr.Name, k, "it left the list")
+		}
+	}
+	w.mu.Unlock()
+	return nil
+}
+
+// unwaitLocked gives up on a held item: it is counted as dropped. Caller holds w.mu.
+func (w *Worker) unwaitLocked(trigger, key, why string) {
+	if !w.tgWait[trigger][key] {
+		return
+	}
+	delete(w.tgWait[trigger], key)
+	w.tgDrop[trigger]++
+	log.Printf("trigger %s: dropped %s: %s before there was room", trigger, key, why)
 }
 
 // submit asks the server to queue a triggered task for roomID.

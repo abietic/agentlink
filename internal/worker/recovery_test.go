@@ -500,6 +500,41 @@ func TestShutdownBeforeRunning(t *testing.T) {
 	}
 }
 
+// TestRemovingRecoveryForgetsTheLedger checks the emergency stop: taking a trigger's recovery
+// out of the config and restarting drops every ledger entry it had, in any state, so putting
+// the config back later does not ask the server for all of them again.
+func TestRemovingRecoveryForgetsTheLedger(t *testing.T) {
+	w, _, _ := ledgerWorker(t, Recovery{On: []string{"error"}})
+	for i, st := range []string{"queued", "running", "waiting", "sent"} {
+		k := fmt.Sprintf("alerts/k%d", i)
+		w.pending[k] = &pendingRun{Source: "trigger", Trigger: "alerts", Key: fmt.Sprintf("k%d", i), RoomID: "R1", Text: "x", First: w.now(), State: st, Want: "run"}
+	}
+	w.mu.Lock()
+	w.savePendingLocked()
+	w.mu.Unlock()
+
+	cfg := w.cfg
+	cfg.Recovery = nil
+	off, err := New(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(off.pending) != 4 {
+		t.Fatalf("setup: loaded %d entries", len(off.pending))
+	}
+	off.adopt()
+	if len(off.pending) != 0 {
+		t.Fatalf("kept without a recovery config: %+v", off.pending)
+	}
+	on, err := New(w.cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(on.pending) != 0 {
+		t.Fatalf("came back with the config: %+v", on.pending)
+	}
+}
+
 func TestEndOfTellsASignInFailureApart(t *testing.T) {
 	live, stopped := context.Background(), func() context.Context {
 		ctx, cancel := context.WithCancel(context.Background())
