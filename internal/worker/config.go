@@ -5,6 +5,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"time"
 
@@ -36,6 +37,10 @@ type Config struct {
 	TankaVerify string `json:"tanka_verify"`
 	// TankaAppID, when set, must equal the event's api_app_id.
 	TankaAppID string `json:"tanka_app_id"`
+	// TankaMentions are the bot's display names, as in the server's bots[].mentions; required
+	// with tanka_verify, since the prompt is cut out of the signed text here, not taken from
+	// the server.
+	TankaMentions []string `json:"tanka_mentions"`
 	// TankaMaxAgeSec bounds how old an event may be; default 3600, matching the queue.
 	// A Tanka event is kept against replay for this long plus an hour.
 	TankaMaxAgeSec int `json:"tanka_max_age_sec"`
@@ -128,6 +133,9 @@ func (c *Config) applyDefaults() error {
 	case "", "observe", "require":
 	default:
 		return errors.New(`tanka_verify must be "", "observe" or "require"`)
+	}
+	if c.TankaVerify != "" && !slices.ContainsFunc(c.TankaMentions, func(n string) bool { return n != "" }) {
+		return errors.New("tanka_verify needs tanka_mentions: the bot's display names, as in the server's bots[].mentions")
 	}
 	if c.TankaMaxAgeSec <= 0 {
 		c.TankaMaxAgeSec = 3600

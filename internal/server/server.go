@@ -384,7 +384,7 @@ func (s *Server) onMention(bot *Bot, ev tanka.MentionEvent, raw []byte, rawTS, r
 		}
 		return
 	}
-	text := stripMention(ev.Text, bot.Mentions)
+	text := tanka.StripMention(ev.Text, bot.Mentions)
 	if fromBot {
 		switch n := s.botHop(ev.RoomID); {
 		case n == maxBotHops+1:
@@ -395,7 +395,7 @@ func (s *Server) onMention(bot *Bot, ev tanka.MentionEvent, raw []byte, rawTS, r
 			log.Printf("bot %s room=%s: bot-sent mention %d in a row dropped", bot.Name, ev.RoomID, n)
 			return
 		}
-		text = afterMention(ev.Text, bot.Mentions)
+		text = tanka.AfterMention(ev.Text, bot.Mentions)
 	} else {
 		s.mu.Lock()
 		delete(s.hops, ev.RoomID)
@@ -430,46 +430,6 @@ func (s *Server) botHop(room string) int {
 	}
 	h.n, h.last = h.n+1, s.now()
 	return h.n
-}
-
-// afterMention returns what follows the first "@<configured name>" in a bot's message, so the
-// bot handing work on can write to its own reader first. Tanka delivers every mention as
-// "@Display Name". Without one it falls back to stripMention.
-func afterMention(text string, names []string) string {
-	at := -1
-	var rest string
-	for _, n := range names {
-		if n == "" {
-			continue
-		}
-		if i := strings.Index(text, "@"+n); i >= 0 && (at < 0 || i < at) {
-			at, rest = i, text[i+1+len(n):]
-		}
-	}
-	if at < 0 {
-		return stripMention(text, names)
-	}
-	return strings.TrimSpace(rest)
-}
-
-// stripMention removes the leading bot mention: "<@ID>", "@<configured name>", or else "@word".
-func stripMention(text string, names []string) string {
-	t := strings.TrimSpace(text)
-	switch {
-	case strings.HasPrefix(t, "<@"):
-		if i := strings.IndexByte(t, '>'); i > 0 {
-			return strings.TrimSpace(t[i+1:])
-		}
-	case strings.HasPrefix(t, "@"):
-		for _, n := range names {
-			if n != "" && strings.HasPrefix(t[1:], n) {
-				return strings.TrimSpace(t[1+len(n):])
-			}
-		}
-		_, rest := proto.CutWord(t)
-		return rest
-	}
-	return t
 }
 
 func (s *Server) pair(bot *Bot, ev tanka.MentionEvent, deviceID string) string {

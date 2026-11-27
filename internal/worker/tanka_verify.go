@@ -7,7 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"log"
-	"strings"
+
 	"time"
 
 	"agentlink/internal/proto"
@@ -60,13 +60,13 @@ func (w *Worker) verifyTanka(t *proto.Task) error {
 	if env.Type != "event_callback" || ev == nil || ev.Type != "app_mention" {
 		return errors.New("the Tanka event is not an app_mention")
 	}
-	replay := env.EventID != "" && w.tankaEventSeen(env.EventID)
+	replay := w.tankaEventSeen(env.EventID)
 	room := t.RoomID
 	// From here on the event's own fields are the truth; the server's are only hints.
 	t.RoomID, t.RoomName = ev.RoomID, ev.RoomName
 	t.UserID, t.UserName = ev.UserID, ev.UserName
 	t.SenderType = ev.SenderType
-	t.Text = textAfterMention(ev.Text, t.Text)
+	t.Text = tanka.PromptText(ev.Text, w.cfg.TankaMentions, ev.SenderType == "bot")
 	t.Attachments = attachmentsFromRaw(ev.Attachments)
 	if reply := ev.ReplyMessageID(); reply != "" {
 		t.ReplyMessageID = reply
@@ -80,34 +80,14 @@ func (w *Worker) verifyTanka(t *proto.Task) error {
 	if w.cfg.TankaAppID != "" && env.APIAppID != w.cfg.TankaAppID {
 		return errors.New("the event's app id is not tanka_app_id")
 	}
+	if env.EventID == "" {
+		return errors.New("the Tanka event has no event_id, so a replay could not be told apart")
+	}
 	if replay {
 		return errors.New("a replay of a Tanka event already handled")
 	}
-	if env.EventID != "" {
-		w.markTankaEvent(env.EventID)
-	}
+	w.markTankaEvent(env.EventID)
 	return nil
-}
-
-// textAfterMention is the signed event's text with the bot mention removed. The server's
-// already-stripped text is used as a hint when it is a tail of the event's own text, so a
-// display name with spaces is cut where the server cut it; otherwise the first mention is
-// dropped here. Either way only words from the signed text survive.
-func textAfterMention(raw, hint string) string {
-	raw = strings.TrimSpace(raw)
-	if hint = strings.TrimSpace(hint); hint != "" && strings.HasSuffix(raw, hint) {
-		return hint
-	}
-	if strings.HasPrefix(raw, "<@") {
-		if i := strings.IndexByte(raw, '>'); i > 0 {
-			return strings.TrimSpace(raw[i+1:])
-		}
-	}
-	if strings.HasPrefix(raw, "@") {
-		_, rest := proto.CutWord(raw)
-		return rest
-	}
-	return raw
 }
 
 // attachmentsFromRaw copies the attachments of the signed event; the server's list is unused.

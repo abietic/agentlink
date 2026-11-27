@@ -459,7 +459,7 @@ func TestStripMention(t *testing.T) {
 		"no mention here":     "no mention here",
 		"@Agent Link @Lee 看看": "@Lee 看看",
 	} {
-		if got := stripMention(in, names); got != want {
+		if got := tanka.StripMention(in, names); got != want {
 			t.Errorf("stripMention(%q) = %q, want %q", in, got, want)
 		}
 	}
@@ -634,7 +634,7 @@ func TestAfterMention(t *testing.T) {
 		"<@B123> cd ~/Code/x":                    "cd ~/Code/x",
 		"no mention here":                        "no mention here",
 	} {
-		if got := afterMention(in, names); got != want {
+		if got := tanka.AfterMention(in, names); got != want {
 			t.Errorf("afterMention(%q) = %q, want %q", in, got, want)
 		}
 	}

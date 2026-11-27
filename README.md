@@ -246,7 +246,7 @@ AGENTLINK_ENROLL_TOKEN=... agentlink-worker
 ## 安全模型
 
 - **入口**：每个事件都要通过对应机器人的 HMAC 签名校验（±5 分钟）；配了 `app_id` 的机器人还要求 `api_app_id` 一致；`event_id` 去重（在内存里，server 重启前后各算一次：重启那一刻 Tanka 恰好重投的事件可能执行两次）；同一个结果只回帖一次（同样记在内存里）；`response_url` 只接受 `response_url_prefix` 开头的地址。
-- **worker 自验签名（`tanka_verify`）**：`""`（默认，即现状）、`observe`（验签并计数、记日志，仍执行）、`require`（不通过就丢弃、不回帖）。签名密钥不在 `worker.json`：`agentlink-worker set-secret tanka` 从 stdin 读入，加密后存在 `worker.db`（stdin 为空则删除）；开了 observe/require 却没存密钥会启动失败。worker 用任务里携带的原始事件（`Raw`）验签，群、发送人、正文、附件、`api_app_id` 都以它为准，`event_id` 持久去重（保留 `tanka_max_age_sec` + 1 小时）；自己提交的触发任务记入台账，只认回提交过的那一条（Sentry 钩子产生的任务在 require 下被拒）。失败计数进 `status` 和每小时汇总。
+- **worker 自验签名（`tanka_verify`）**：`""`（默认，即现状）、`observe`（验签并计数、记日志，仍执行）、`require`（不通过就丢弃、不回帖）。签名密钥不在 `worker.json`：`agentlink-worker set-secret tanka` 从 stdin 读入，加密后存在 `worker.db`（stdin 为空则删除）；开了 observe/require 却没存密钥会启动失败。同时必须配 `tanka_mentions`（机器人显示名，同 server 的 `bots[].mentions`）：正文由 worker 按同一套规则从签名原文里去掉 @ 得出，不用 server 给的正文。worker 用任务里携带的原始事件（`Raw`）验签，群、发送人、正文、附件、`api_app_id` 都以它为准，没有 `event_id` 的事件直接拒，`event_id` 持久去重（保留 `tanka_max_age_sec` + 1 小时）；自己提交的触发任务记入台账，只认回提交过的那一条（Sentry 钩子产生的任务在 require 下被拒）。失败计数进 `status` 和每小时汇总。
 - **上线顺序**：先 `observe` 跑一阵，确认汇总里没有失败，再切 `require`；之后（后续版本）把签名密钥从 server 移走、server 改用 `verify: worker` 模式。
 - **谁能驱动机器**：server 的 `allowed_users` 是可选的粗过滤；最终由 worker 本机的 `allowed_users`（人）和 `allowed_bots`（别的机器人）决定，默认拒绝所有人。设备注册需要 enroll token。
 - **机器人之间交接**：Tanka 自 2026-11-05 起投递机器人和 webhook 发出的 @（事件里 `sender_type` 为 `bot`，机器人 @ 自己不投递）。`allowed_bots` 里的机器人 @ 本机器人时照常执行，用来让一个 agent 把工作交给另一个：交出方在回复里写 `<@下一个机器人> 要它做的事`，下一个机器人收到的 prompt 是这个 @ 之后的全部文字（@ 之前的内容是写给群里的人看的，不会带过去）。几条防护：

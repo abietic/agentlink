@@ -95,6 +95,7 @@ func newVerifiedWorker(t *testing.T, mode string, api *apiCapture) (*fixture, *W
 	f.cfg.ServerURL = api.URL
 	f.cfg.TankaVerify = mode
 	f.cfg.TankaAppID = "A1"
+	f.cfg.TankaMentions = []string{"Agent Link", "bot"}
 	if err := SetSecret(f.cfg, "tanka", []byte(testTankaSecret)); err != nil {
 		t.Fatal(err)
 	}
@@ -210,6 +211,47 @@ func TestVerifyTankaRejects(t *testing.T) {
 	second := ev.task("d2", "R1")
 	if err := w.verifyTanka(&second); err == nil || !strings.Contains(err.Error(), "replay") {
 		t.Fatalf("a replay was accepted: %v", err)
+	}
+
+	// An event without an id could be replayed unnoticed, so it is refused.
+	noID := newSignedEvent(testTankaSecret, now.Add(3*time.Second), func(env *tanka.Envelope) { env.EventID = "" }).task("e", "R1")
+	if err := w.verifyTanka(&noID); err == nil || !strings.Contains(err.Error(), "event_id") {
+		t.Fatalf("an event without event_id: err = %v", err)
+	}
+}
+
+// TestPromptFromSignedTextOnly checks that the prompt is cut out of the signed text by the
+// worker's own mention rule, so a server cannot drop words (say a leading "do not") by
+// sending a shorter tail of the signed text as its stripped copy.
+func TestPromptFromSignedTextOnly(t *testing.T) {
+	api := newAPICapture(t)
+	_, w, now := newVerifiedWorker(t, "require", api)
+	for i, tc := range []struct {
+		sender, raw, hint, want string
+	}{
+		{"", "@Agent Link do not delete the branch", "delete the branch", "do not delete the branch"},
+		{"", "@bot do not deploy", "deploy", "do not deploy"},
+		{"", "<@U99> do not deploy", "deploy", "do not deploy"},
+		// A bot's words before the mention are for its own reader, as on the server.
+		{"bot", "Over to you. @Agent Link run the tests", "", "run the tests"},
+	} {
+		task := newSignedEvent(testTankaSecret, now.Add(time.Duration(i)*time.Second), func(env *tanka.Envelope) {
+			env.Event.Text, env.Event.SenderType = tc.raw, tc.sender
+		}).task(fmt.Sprintf("p%d", i), "R1")
+		task.Text = tc.hint
+		if err := w.verifyTanka(&task); err != nil {
+			t.Fatalf("%q: verify: %v", tc.raw, err)
+		}
+		if task.Text != tc.want {
+			t.Errorf("%q with hint %q: prompt %q, want %q", tc.raw, tc.hint, task.Text, tc.want)
+		}
+	}
+}
+
+func TestTankaVerifyNeedsMentions(t *testing.T) {
+	c := Config{TankaVerify: "observe", WorkdirRoots: []string{t.TempDir()}}
+	if err := c.applyDefaults(); err == nil || !strings.Contains(err.Error(), "tanka_mentions") {
+		t.Fatalf("tanka_verify without tanka_mentions: err = %v", err)
 	}
 }
 
