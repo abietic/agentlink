@@ -28,6 +28,17 @@ type Config struct {
 	// an agent hands on only by mentioning the next bot itself, so two bots cannot keep
 	// triggering each other.
 	AllowedBots []string `json:"allowed_bots"`
+	// TankaVerify says how hard this worker checks a mention's Tanka signature itself
+	// instead of trusting the server: "" (off, the default), "observe" (verify, count and log
+	// a failure, run the task anyway) or "require" (drop a task that does not check out and
+	// post nothing). The signing secret is not here: store it with
+	// `agentlink-worker set-secret tanka` (it is kept encrypted in worker.db).
+	TankaVerify string `json:"tanka_verify"`
+	// TankaAppID, when set, must equal the event's api_app_id.
+	TankaAppID string `json:"tanka_app_id"`
+	// TankaMaxAgeSec bounds how old an event may be; default 3600, matching the queue.
+	// A Tanka event is kept against replay for this long plus an hour.
+	TankaMaxAgeSec int `json:"tanka_max_age_sec"`
 	// WorkdirRoots bound `cd`: a workdir must be one of these or inside one. Default ~/Code.
 	WorkdirRoots   []string `json:"workdir_roots"`
 	DefaultWorkdir string   `json:"default_workdir"` // default the first root
@@ -113,6 +124,14 @@ func (c *Config) applyDefaults() error {
 	if c.MaxOutputChars <= 0 {
 		c.MaxOutputChars = 3500
 	}
+	switch c.TankaVerify {
+	case "", "observe", "require":
+	default:
+		return errors.New(`tanka_verify must be "", "observe" or "require"`)
+	}
+	if c.TankaMaxAgeSec <= 0 {
+		c.TankaMaxAgeSec = 3600
+	}
 	if err := c.checkHarnesses(); err != nil {
 		return err
 	}
@@ -131,6 +150,12 @@ func (c *Config) applyDefaults() error {
 func (c Config) stall() time.Duration { return time.Duration(c.StallSec) * time.Second }
 
 func (c Config) timeout() time.Duration { return time.Duration(c.TimeoutSec) * time.Second }
+
+// tankaMaxAge is how old a Tanka event may be, and how long an event id is kept against
+// replay (plus an hour; see markTankaEvent).
+func (c Config) tankaMaxAge() time.Duration {
+	return time.Duration(c.TankaMaxAgeSec) * time.Second
+}
 
 func expandHome(p string) string {
 	if p == "~" || strings.HasPrefix(p, "~/") {

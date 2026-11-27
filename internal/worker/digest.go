@@ -25,11 +25,12 @@ type Digest struct {
 
 // Why an item was not triaged, as the digest says it.
 const (
-	whyStale  = "older than max_age_sec when first seen"
-	whyHeld   = "held at the burst bounds until it %s"
-	whyBurst  = "refused at the burst bounds"
-	whySilent = "the run found nothing new ([[silent]])"
-	whySkip   = "skipped by the poll: %s"
+	whyStale     = "older than max_age_sec when first seen"
+	whyHeld      = "held at the burst bounds until it %s"
+	whyBurst     = "refused at the burst bounds"
+	whySilent    = "the run found nothing new ([[silent]])"
+	whySkip      = "skipped by the poll: %s"
+	whySignature = "signature" // a mention whose Tanka event did not check out
 )
 
 // suppressedKeep bounds the record between digests; past it only a count is kept.

@@ -395,10 +395,24 @@ func (w *Worker) submit(ctx context.Context, roomID, trigger, key, text string) 
 		log.Printf("task %s: redacted %d secret-like strings", trigger, n)
 		text = withRedactionNote(clean, n)
 	}
+	// Record what this worker asked for before asking, so the task can only come back as the
+	// one it submitted. Off, the record is not made and any task is accepted, as before.
+	if w.cfg.TankaVerify != "" {
+		w.recordTrigger(trigger, key, text)
+	}
 	plain, _ := json.Marshal(proto.TriggerBody{Trigger: trigger, Key: key, Text: text})
 	sealed, err := seal.Seal(w.key, w.serverKey, proto.TriggerContext(w.id.DeviceID, roomID), plain)
 	if err != nil {
+		if w.cfg.TankaVerify != "" {
+			w.forgetTrigger(trigger, key, text)
+		}
 		return err
 	}
-	return w.client.Trigger(ctx, proto.TriggerRequest{RoomID: roomID, Sealed: sealed})
+	if err := w.client.Trigger(ctx, proto.TriggerRequest{RoomID: roomID, Sealed: sealed}); err != nil {
+		if w.cfg.TankaVerify != "" {
+			w.forgetTrigger(trigger, key, text)
+		}
+		return err
+	}
+	return nil
 }

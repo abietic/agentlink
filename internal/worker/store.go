@@ -57,6 +57,13 @@ func (st *store) put(k string, v any) error {
 	return err
 }
 
+func (st *store) delete(k string) error {
+	_, err := st.db.Exec(`DELETE FROM kv WHERE k = ?`, k)
+	return err
+}
+
+func (st *store) Close() error { return st.db.Close() }
+
 func (st *store) decode(k string, boxed []byte, v any) error {
 	plain, err := seal.Unbox(st.key, k, boxed)
 	if err != nil {

@@ -114,6 +114,13 @@ type Worker struct {
 	sessionOf map[string]string      // by task id: the session its last run left, sent with its result
 	claudeDir string                 // Claude Code's config directory, where it keeps session titles
 
+	// What this worker checked itself when tanka_verify is set; see tanka_verify.go.
+	tankaSecret   []byte
+	tankaSeen     map[string]time.Time // Tanka event id → when to forget it
+	triggerLedger map[string]time.Time // trigger submissions not yet matched by their task
+	tankaFailed   int                  // tasks whose Tanka event or trigger ledger did not check out
+	tankaRejected int                  // of those, tasks dropped because tanka_verify is "require"
+
 	// A trigger's burst budget, kept in memory: what it has admitted and not yet answered,
 	// what it admitted in the last minute, and what it dropped since it last said anything.
 	tgLoad map[string]int
@@ -153,6 +160,9 @@ func New(cfg Config) (*Worker, error) {
 		claudeDir: claudeConfigDir(),
 		files:     attachmentClient,
 		fileOK:    tankaFile,
+
+		tankaSeen:     map[string]time.Time{},
+		triggerLedger: map[string]time.Time{},
 	}
 	for name, h := range cfg.Harnesses {
 		w.runners[name] = h.runner(cfg.timeout(), cfg.stall())
@@ -171,6 +181,18 @@ func New(cfg Config) (*Worker, error) {
 	}
 	if _, err := st.get("suppressed", &w.supp); err != nil {
 		return nil, err
+	}
+	if _, err := st.get(secretKeyTanka, &w.tankaSecret); err != nil {
+		return nil, err
+	}
+	if _, err := st.get("tanka_seen", &w.tankaSeen); err != nil {
+		return nil, err
+	}
+	if _, err := st.get("trigger_ledger", &w.triggerLedger); err != nil {
+		return nil, err
+	}
+	if w.cfg.TankaVerify != "" && len(w.tankaSecret) == 0 {
+		return nil, fmt.Errorf("tanka_verify is %q but no Tanka signing secret is stored: run `agentlink-worker set-secret tanka` and give it the app's signing secret on stdin, or set tanka_verify to \"\"", w.cfg.TankaVerify)
 	}
 	if err := pruneRunLog(w.runLogPath(), w.now()); err != nil {
 		log.Printf("run log: %v", err)
@@ -304,6 +326,9 @@ func (w *Worker) status() proto.WorkerStatus {
 }
 
 func (w *Worker) dispatch(ctx context.Context, t proto.Task) {
+	if !w.checkTanka(&t) {
+		return // rejected: no reply is posted, so a forged task cannot reach the room
+	}
 	if t.Trigger == digestTrigger {
 		// The worker's own digest, back from the server: post it as it is, with no run. Only
 		// to the digest's room, so a digest cannot be pointed anywhere else.
@@ -1030,6 +1055,9 @@ func (w *Worker) query(roomID, name string) string {
 	}
 	if queued > 0 {
 		fmt.Fprintf(&b, "- **Queued** %d\n", queued)
+	}
+	if w.cfg.TankaVerify != "" {
+		fmt.Fprintf(&b, "- **Tanka verification** `%s` · %d failed · %d rejected\n", w.cfg.TankaVerify, w.tankaFailed, w.tankaRejected)
 	}
 	b.WriteString(w.limitsLocked())
 	return strings.TrimRight(b.String(), "\n")
