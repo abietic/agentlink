@@ -255,6 +255,7 @@ AGENTLINK_ENROLL_TOKEN=... agentlink-worker
 - **能做什么**：工作目录限制在 `workdir_roots` 之内（先解析符号链接再判断）。默认 `permissionMode: "auto"`：由模型分类器逐个批准或拒绝工具调用，判断不了的一律拒绝（没人在场回答权限询问），回复里会注明被拒绝的次数。要更严就改成 `"dontAsk"` 并用 `allowedTools` 预先放行，要更松就在 `allowedTools` 里加。群消息是不可信输入，可能被用来做 prompt 注入；分类器能挡住一部分，但不等于沙箱，`allowed_users` 要保持最小。
 - **触发任务**：只有两个来源能产生——server 的 Sentry 钩子（HMAC 校验）和设备自己（用设备密钥加密），所以不过 `allowed_users`。但告警标题等字段是外部可控的文本，同样是 prompt 注入面：模板里的字段会被压成一行并截断，prompt 里要写明它们只是数据。
 - **数据**：会话的完整记录留在 worker 本机（Claude Code 自己的 `~/.claude/projects`；mirasim harness 则在 mirasim 的存储里，mirasim 的手机端和协作空间成员按 mirasim 的权限能看到），群里发的图片也在里面。附件链接不用登录就能下载，所以只在加密的任务里传，不写日志、不出现在错误信息里。
+- **回帖脱敏**：worker 把要发到群里的文字（结果、汇总、通知）先过一遍密钥模式（AWS key、私钥、GitHub/GitLab/Sentry/Slack token、sk- key、JWT、带密码的 URL、password=… 等），命中的换成 [REDACTED] 并注明遮盖了几处。这是兜底，不能代替最小权限。
 
 ## 开发
 

@@ -388,8 +388,13 @@ func (w *Worker) unwaitLocked(trigger, key, why string) bool {
 	return true
 }
 
-// submit asks the server to queue a triggered task for roomID.
+// submit asks the server to queue a triggered task for roomID. The body is text that becomes
+// a room message (a digest, an alert), so it is redacted here as well.
 func (w *Worker) submit(ctx context.Context, roomID, trigger, key, text string) error {
+	if clean, n := redactSecrets(text); n > 0 {
+		log.Printf("task %s: redacted %d secret-like strings", trigger, n)
+		text = withRedactionNote(clean, n)
+	}
 	plain, _ := json.Marshal(proto.TriggerBody{Trigger: trigger, Key: key, Text: text})
 	sealed, err := seal.Seal(w.key, w.serverKey, proto.TriggerContext(w.id.DeviceID, roomID), plain)
 	if err != nil {

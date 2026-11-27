@@ -150,7 +150,7 @@ func digestText(items []suppressed, over int, every time.Duration, limit int) st
 	}
 	var b strings.Builder
 	fmt.Fprintf(&b, "🧾 Not triaged in the last %s: %d trigger item(s). Check that none of them should have run.", every.Round(time.Minute), len(items)+over)
-	cut := 0
+	cut, nRedacted := 0, 0
 	for _, g := range groups {
 		head := fmt.Sprintf("\n\n**%s** · %s · %d", g.trigger, g.why, len(g.items))
 		if limit > 0 && b.Len()+len(head) > limit-80 {
@@ -159,9 +159,15 @@ func digestText(items []suppressed, over int, every time.Duration, limit int) st
 		}
 		b.WriteString(head)
 		for _, it := range g.items {
-			line := fmt.Sprintf("\n- %s %s", it.At.Local().Format("15:04"), it.Summary)
+			// Mask before the limit check, so a secret is never cut in half and left as a
+			// fragment no pattern matches.
+			body, n := redactSecrets(it.Summary)
+			nRedacted += n
+			line := fmt.Sprintf("\n- %s %s", it.At.Local().Format("15:04"), body)
 			if it.Summary == "" {
-				line = fmt.Sprintf("\n- %s `%s`", it.At.Local().Format("15:04"), it.Key)
+				key, n := redactSecrets(it.Key)
+				nRedacted += n
+				line = fmt.Sprintf("\n- %s `%s`", it.At.Local().Format("15:04"), key)
 			}
 			if limit > 0 && b.Len()+len(line) > limit-80 {
 				cut++
@@ -172,6 +178,11 @@ func digestText(items []suppressed, over int, every time.Duration, limit int) st
 	}
 	if cut+over > 0 {
 		fmt.Fprintf(&b, "\n\n…and %d more not listed; the worker log has each one.", cut+over)
+	}
+	if nRedacted > 0 {
+		log.Printf("task %s: redacted %d secret-like strings", digestTrigger, nRedacted)
+		b.WriteString("\n\n")
+		b.WriteString(redactionNote(nRedacted))
 	}
 	return b.String()
 }

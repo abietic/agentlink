@@ -497,7 +497,13 @@ func (w *Worker) send(t proto.Task, text string) {
 }
 
 // post seals and posts a result, retrying only when the request may not have reached the server.
+// Every reply leaves through here, so it redacts secrets once more no matter how the text was
+// built; format already redacts before truncating, but notes and notices do not pass through it.
 func (w *Worker) post(t proto.Task, text string) {
+	if clean, n := redactSecrets(text); n > 0 {
+		log.Printf("task %s: redacted %d secret-like strings", t.ID, n)
+		text = withRedactionNote(clean, n)
+	}
 	rec := runRecord{Event: "result", Task: t.ID, Trigger: t.Trigger, Bytes: len(text)}
 	defer func() { w.logRun(rec) }()
 	w.mu.Lock()
@@ -911,6 +917,10 @@ func (w *Worker) format(ctx context.Context, t proto.Task, run Run, res RunResul
 		// people: the run found nothing new, so the body says that.
 		res.Text = "Nothing new to report."
 	}
+	// Redact before the body is truncated to max_output_chars: a cut through a secret would
+	// leave a fragment no pattern matches. post redacts again as the final net.
+	var nRedacted int
+	res.Text, nRedacted = redactSecrets(res.Text)
 	var b strings.Builder
 	switch {
 	case res.Stopped && ctx.Err() != nil:
@@ -956,6 +966,11 @@ func (w *Worker) format(ctx context.Context, t proto.Task, run Run, res RunResul
 	fmt.Fprintf(&b, " · %s", res.Duration.Round(time.Second))
 	if res.CostUSD > 0 {
 		fmt.Fprintf(&b, " · $%.2f", res.CostUSD)
+	}
+	if nRedacted > 0 {
+		log.Printf("task %s: redacted %d secret-like strings", t.ID, nRedacted)
+		b.WriteString("\n\n")
+		b.WriteString(redactionNote(nRedacted))
 	}
 	return b.String()
 }
