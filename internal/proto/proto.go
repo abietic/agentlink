@@ -58,6 +58,13 @@ type Task struct {
 	// came from. The worker treats it like a session id at the start of the text, unless the
 	// text starts with one.
 	RouteSessionID string `json:"route_session_id,omitempty"`
+	// Raw is the Tanka request body that carried this mention, byte for byte, and RawTS and
+	// RawSig are its X-Tanka-Request-Timestamp and X-Tanka-Signature headers. A worker with a
+	// signing secret verifies them itself instead of trusting the fields above; a triggered
+	// or Sentry task carries none.
+	Raw    []byte `json:"raw,omitempty"`
+	RawTS  string `json:"raw_ts,omitempty"`
+	RawSig string `json:"raw_sig,omitempty"`
 	// Reply is the Envelope's Reply, kept by the worker to send back with the result.
 	Reply []byte `json:"-"`
 }

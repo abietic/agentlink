@@ -324,7 +324,9 @@ func (s *Server) handleEvent(w http.ResponseWriter, r *http.Request) {
 		log.Printf("bot %s: event %s shape %q", bot.Name, env.EventID, shape(raw))
 	}
 	if env.Type == "event_callback" && env.Event != nil && env.Event.Type == "app_mention" && s.firstSeen(bot.Name+"/"+env.EventID, dedupeTTL) {
-		s.onMention(bot, *env.Event)
+		// The body and its two signature headers travel with the task, sealed, so a worker
+		// with a signing secret can verify this event itself.
+		s.onMention(bot, *env.Event, body, r.Header.Get(tanka.HeaderTimestamp), r.Header.Get(tanka.HeaderSignature))
 	}
 	writeJSON(w, http.StatusOK, map[string]int{"code": 0})
 }
@@ -371,7 +373,7 @@ func (s *Server) firstSeen(key string, ttl time.Duration) bool {
 	return true
 }
 
-func (s *Server) onMention(bot *Bot, ev tanka.MentionEvent) {
+func (s *Server) onMention(bot *Bot, ev tanka.MentionEvent, raw []byte, rawTS, rawSig string) {
 	// sender_type is not in Tanka's docs; its value (not message content) says whether bots' mentions arrive.
 	log.Printf("bot %s: mention room=%s user=%s sender_type=%q", bot.Name, ev.RoomID, ev.UserID, ev.SenderType)
 	fromBot := ev.SenderType == "bot"
@@ -411,7 +413,7 @@ func (s *Server) onMention(bot *Bot, ev tanka.MentionEvent) {
 	case kw == "unpair":
 		s.replyAsync(bot, ev.RoomID, ev.ResponseURL, s.unpair(bot, ev.RoomID))
 	default:
-		s.enqueue(bot, ev, text)
+		s.enqueue(bot, ev, text, raw, rawTS, rawSig)
 	}
 }
 
@@ -514,7 +516,7 @@ func (s *Server) unpair(bot *Bot, roomID string) string {
 	return fmt.Sprintf("Unpaired this room from device `%s`.", dev)
 }
 
-func (s *Server) enqueue(bot *Bot, ev tanka.MentionEvent, text string) {
+func (s *Server) enqueue(bot *Bot, ev tanka.MentionEvent, text string, raw []byte, rawTS, rawSig string) {
 	d, err := s.deviceWhere(`id = (SELECT device_id FROM bindings WHERE bot = ? AND room_id = ?)`, bot.Name, ev.RoomID)
 	var msg string
 	switch {
@@ -527,7 +529,7 @@ func (s *Server) enqueue(bot *Bot, ev tanka.MentionEvent, text string) {
 		// Not queued: a prompt that runs hours later, when the laptop wakes up, would surprise.
 		msg = fmt.Sprintf("Device `%s` is offline (last seen %s), so nothing was queued.", d.ID, s.ago(d.LastSeen))
 	default:
-		t := proto.Task{RoomID: ev.RoomID, RoomName: ev.RoomName, UserID: ev.UserID, UserName: ev.UserName, Text: text, SenderType: ev.SenderType, ReplyMessageID: ev.ReplyMessageID()}
+		t := proto.Task{RoomID: ev.RoomID, RoomName: ev.RoomName, UserID: ev.UserID, UserName: ev.UserName, Text: text, SenderType: ev.SenderType, ReplyMessageID: ev.ReplyMessageID(), Raw: raw, RawTS: rawTS, RawSig: rawSig}
 		for _, a := range ev.Attachments {
 			t.Attachments = append(t.Attachments, proto.Attachment{URL: a.URL, Name: a.Name})
 		}

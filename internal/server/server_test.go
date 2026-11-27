@@ -686,3 +686,50 @@ func TestReplySurvivesTankaOutage(t *testing.T) {
 		time.Sleep(10 * time.Millisecond)
 	}
 }
+
+// TestEnqueuedTaskCarriesRawEvent checks that a task made from a Tanka event carries the
+// exact request body and its two signature headers, so a worker can verify it itself, and
+// that a task the server made from a trigger carries none.
+func TestEnqueuedTaskCarriesRawEvent(t *testing.T) {
+	_, base, ft := newTestServer(t, nil)
+	dev := register(t, base, "")
+	sendEvent(t, base, mention(ft, "R1", "U1", "@Agent Link pair "+dev.DeviceID))
+	ft.next(t)
+	if task := dev.poll(t); task != nil { // nothing queued, but the poll marks the device online
+		t.Fatalf("unexpected task %+v", task)
+	}
+
+	ev := mention(ft, "R1", "U1", "@Agent Link carry the bytes")
+	body, _ := json.Marshal(ev)
+	tss := strconv.FormatInt(time.Now().Unix(), 10)
+	sig := tanka.Sign([]byte(secret), tss, body)
+	req, _ := http.NewRequest(http.MethodPost, base+"/tanka/events", bytes.NewReader(body))
+	req.Header.Set(tanka.HeaderTimestamp, tss)
+	req.Header.Set(tanka.HeaderSignature, sig)
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+
+	task := dev.poll(t)
+	if task == nil {
+		t.Fatal("no task was queued")
+	}
+	if !bytes.Equal(task.Raw, body) || task.RawTS != tss || task.RawSig != sig {
+		t.Fatalf("task raw = %q ts = %q sig = %q, want the request body and headers", task.Raw, task.RawTS, task.RawSig)
+	}
+
+	plain, _ := json.Marshal(proto.TriggerBody{Trigger: "alerts", Key: "k", Text: "triggered"})
+	serverKey, _ := seal.ParsePublicKey(dev.ServerKey)
+	sealed, err := seal.Seal(dev.key, serverKey, proto.TriggerContext(dev.DeviceID, "R1"), plain)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if code := api(t, http.MethodPost, base+"/api/v1/trigger", dev.DeviceToken, proto.TriggerRequest{RoomID: "R1", Sealed: sealed}, nil); code != http.StatusOK {
+		t.Fatalf("trigger: HTTP %d", code)
+	}
+	if triggered := dev.poll(t); triggered == nil || triggered.Trigger != "alerts" || len(triggered.Raw) != 0 || triggered.RawTS != "" || triggered.RawSig != "" {
+		t.Fatalf("trigger task = %+v, want no raw event", triggered)
+	}
+}
