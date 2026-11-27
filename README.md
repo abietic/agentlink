@@ -245,9 +245,10 @@ AGENTLINK_ENROLL_TOKEN=... agentlink-worker
 
 ## 安全模型
 
-- **入口**：每个事件都要通过对应机器人的 HMAC 签名校验（±5 分钟）；配了 `app_id` 的机器人还要求 `api_app_id` 一致；`event_id` 去重（在内存里，server 重启前后各算一次：重启那一刻 Tanka 恰好重投的事件可能执行两次）；同一个结果只回帖一次（同样记在内存里）；`response_url` 只接受 `response_url_prefix` 开头的地址。
+- **入口**：`verify` 为默认的 `server` 时，每个事件都要通过对应机器人的 HMAC 签名校验（±5 分钟）；配了 `app_id` 的机器人还要求 `api_app_id` 一致；`event_id` 去重（在内存里，server 重启前后各算一次：重启那一刻 Tanka 恰好重投的事件可能执行两次）；同一个结果只回帖一次（同样记在内存里）；`response_url` 只接受 `response_url_prefix` 开头的地址。
 - **worker 自验签名（`tanka_verify`）**：`""`（默认，即现状）、`observe`（验签并计数、记日志，仍执行）、`require`（不通过就丢弃、不回帖）。签名密钥不在 `worker.json`：`agentlink-worker set-secret tanka` 从 stdin 读入，加密后存在 `worker.db`（stdin 为空则删除）；开了 observe/require 却没存密钥会启动失败。同时必须配 `tanka_mentions`（机器人显示名，同 server 的 `bots[].mentions`）：正文由 worker 按同一套规则从签名原文里去掉 @ 得出，不用 server 给的正文。worker 用任务里携带的原始事件（`Raw`）验签，群、发送人、正文、附件、`api_app_id` 都以它为准，没有 `event_id` 的事件直接拒，`event_id` 持久去重（保留 `tanka_max_age_sec` + 1 小时）；自己提交的触发任务记入台账，只认回提交过的那一条（Sentry 钩子产生的任务在 require 下被拒）。失败计数进 `status` 和每小时汇总。
-- **上线顺序**：先 `observe` 跑一阵，确认汇总里没有失败，再切 `require`；之后（后续版本）把签名密钥从 server 移走、server 改用 `verify: worker` 模式。
+- **上线顺序**：先 `observe` 跑一阵，确认汇总里没有失败，再切 `require`；最后把 server 上该机器人改成 `"verify": "worker"`、删掉它的 `signing_secret`（和环境变量），并在 Tanka 后台换一个新的签名密钥，只存到 worker 上。
+- **server 不持有签名密钥（`bots[].verify: "worker"`）**：server 不验签名（也没有密钥可验），所以把每个事件都当作未经验证：`url_verification` 原样返回 challenge；按来源 IP（经本机 Cloudflare 隧道时取 `CF-Connecting-IP`）每分钟 120 条、按群每分钟 30 条限流，超出回 429；没有配对的群什么都不回（包括 `help`、未配对提示、`pair` 用法提示）；名单外的人、连续机器人 @ 的「停下」提示也不回；`pair <设备>` 和 `unpair` 不在 server 上直接生效，而是作为任务发给那台设备（`unpair` 发给当前配对的设备），设备验过签名、确认发送人是 `allowed_users` 里的人（`pair` 还要求点名的是自己）后在结果里确认，server 才改绑定并由 server 自己发「已配对 / 已解除」。**只对报告 `tanka_verify: "require"` 的设备**排任务（worker 每次 poll 上报），否则它会把伪造事件当真执行。已知代价：设备离线时 `pair` / `unpair` 都不生效（离线设备的绑定需在 server 上改库或用 `rooms` 配置）；已配对群里仍会对未验证事件回 `help` 和「设备离线 / 队列已满」这类提示（有限流）；任务日志里的发送人是 server 看到的、未验证的。
 - **谁能驱动机器**：server 的 `allowed_users` 是可选的粗过滤；最终由 worker 本机的 `allowed_users`（人）和 `allowed_bots`（别的机器人）决定，默认拒绝所有人。设备注册需要 enroll token。
 - **机器人之间交接**：Tanka 自 2026-11-05 起投递机器人和 webhook 发出的 @（事件里 `sender_type` 为 `bot`，机器人 @ 自己不投递）。`allowed_bots` 里的机器人 @ 本机器人时照常执行，用来让一个 agent 把工作交给另一个：交出方在回复里写 `<@下一个机器人> 要它做的事`，下一个机器人收到的 prompt 是这个 @ 之后的全部文字（@ 之前的内容是写给群里的人看的，不会带过去）。几条防护：
   - 回帖不会 @ 回机器人；不在名单里的机器人不会得到任何回帖，只记日志。

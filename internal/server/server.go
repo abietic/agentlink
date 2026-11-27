@@ -32,6 +32,7 @@ import (
 	"io"
 	"log"
 	"maps"
+	"net"
 	"net/http"
 	"slices"
 	"strings"
@@ -156,7 +157,18 @@ type Server struct {
 	leased  map[string]*task         // task id → a task a device has taken (without its content)
 	seen    map[string]time.Time     // dedupe key → when to forget it
 	hops    map[string]*botHops      // room → bot-sent mentions since a person's
+	rate    map[string]int           // rate-limit key → events this minute (verify "worker")
+	// verifies is each device's tanka_verify as of its last poll (proto.WorkerStatus).
+	verifies map[string]string
+	rateAt   time.Time // when this minute's counts started
 }
+
+// Events a bot with verify "worker" takes per minute from one sender address and for one
+// room; anyone can post an unsigned event to it, and each may queue a task.
+const (
+	eventsPerIP   = 120
+	eventsPerRoom = 30
+)
 
 // maxBotHops is how many bot-sent mentions in a row a room takes before a person has to
 // mention a bot again. Bots that answer each other would otherwise never stop.
@@ -173,6 +185,8 @@ type task struct {
 	sealed             []byte // proto.Task sealed to the device; nil once taken
 	reply              string // response_url; empty for triggered tasks
 	msg                string // the message id of a person's mention; empty otherwise
+	action             string // proto.Task.Command, for a device to confirm
+	roomName, by       string // with action "pair": the room's name and who typed it
 	created            time.Time
 	until              time.Time // lease end; zero while waiting
 }
@@ -186,6 +200,10 @@ type replyTo struct {
 	URL   string `json:"url"`
 	Until int64  `json:"until"`         // lease end, unix ms: a later result is refused
 	Msg   string `json:"msg,omitempty"` // task.msg
+	// Action, RoomName and By are task.action, task.roomName and task.by.
+	Action   string `json:"action,omitempty"`
+	RoomName string `json:"room_name,omitempty"`
+	By       string `json:"by,omitempty"`
 }
 
 func New(cfg Config) (*Server, error) {
@@ -215,6 +233,7 @@ func New(cfg Config) (*Server, error) {
 		wake:       map[string]chan struct{}{},
 		waiting:    map[string][]*task{},
 		leased:     map[string]*task{},
+		verifies:   map[string]string{},
 		seen:       map[string]time.Time{},
 		hops:       map[string]*botHops{},
 	}
@@ -298,8 +317,16 @@ func (s *Server) handleEvent(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "read error", http.StatusBadRequest)
 		return
 	}
-	err = tanka.Verify([]byte(bot.SigningSecret), r.Header.Get(tanka.HeaderTimestamp), r.Header.Get(tanka.HeaderSignature), body, s.now(), signatureSkew)
-	if err != nil {
+	workerVerifies := bot.Verify == "worker"
+	if workerVerifies {
+		// No secret here to check the event with: the device checks it. Until then, an
+		// unsigned event can only queue a task, so it is rate-limited.
+		if ip := clientIP(r); !s.allow("ip "+ip, eventsPerIP) {
+			log.Printf("bot %s: event from %s over %d a minute, dropped", bot.Name, ip, eventsPerIP)
+			http.Error(w, "too many events", http.StatusTooManyRequests)
+			return
+		}
+	} else if err := tanka.Verify([]byte(bot.SigningSecret), r.Header.Get(tanka.HeaderTimestamp), r.Header.Get(tanka.HeaderSignature), body, s.now(), signatureSkew); err != nil {
 		log.Printf("bot %s: event rejected: %v", bot.Name, err)
 		http.Error(w, "bad signature", http.StatusUnauthorized)
 		return
@@ -316,6 +343,11 @@ func (s *Server) handleEvent(w http.ResponseWriter, r *http.Request) {
 	if bot.AppID != "" && env.APIAppID != bot.AppID {
 		log.Printf("bot %s: event for app %q rejected", bot.Name, env.APIAppID)
 		http.Error(w, "wrong app", http.StatusForbidden)
+		return
+	}
+	if workerVerifies && env.Event != nil && !s.allow("room "+env.Event.RoomID, eventsPerRoom) {
+		log.Printf("bot %s room=%s: over %d events a minute, dropped", bot.Name, env.Event.RoomID, eventsPerRoom)
+		http.Error(w, "too many events", http.StatusTooManyRequests)
 		return
 	}
 	if env.Type == "event_callback" {
@@ -379,7 +411,7 @@ func (s *Server) onMention(bot *Bot, ev tanka.MentionEvent, raw []byte, rawTS, r
 	fromBot := ev.SenderType == "bot"
 	if len(s.cfg.AllowedUsers) > 0 && !slices.Contains(s.cfg.AllowedUsers, ev.UserID) {
 		log.Printf("bot %s room=%s user=%s: not in allowed_users", bot.Name, ev.RoomID, ev.UserID)
-		if !fromBot { // a bot gets no answer: it may answer back
+		if !fromBot && bot.Verify != "worker" { // a bot gets no answer: it may answer back; nor does an unverified sender
 			s.replyAsync(bot, ev.RoomID, ev.ResponseURL, fmt.Sprintf("User `%s` is not allowed to use this bot.", ev.UserID))
 		}
 		return
@@ -389,6 +421,9 @@ func (s *Server) onMention(bot *Bot, ev tanka.MentionEvent, raw []byte, rawTS, r
 		switch n := s.botHop(ev.RoomID); {
 		case n == maxBotHops+1:
 			log.Printf("bot %s room=%s: %d bot-sent mentions in a row, stopping", bot.Name, ev.RoomID, n)
+			if bot.Verify == "worker" {
+				return // the senders are unverified, so this is not said in the room
+			}
 			s.replyAsync(bot, ev.RoomID, ev.ResponseURL, fmt.Sprintf("Stopped here: %d mentions in a row came from bots. A person has to mention a bot before bots can hand on work in this room again.", maxBotHops))
 			return
 		case n > maxBotHops:
@@ -402,7 +437,12 @@ func (s *Server) onMention(bot *Bot, ev tanka.MentionEvent, raw []byte, rawTS, r
 		s.mu.Unlock()
 	}
 	word, arg := proto.CutWord(text)
-	switch kw := proto.Keyword(word); {
+	kw := proto.Keyword(word)
+	if bot.Verify == "worker" {
+		s.mentionForWorker(bot, ev, kw, arg, text, raw, rawTS, rawSig)
+		return
+	}
+	switch {
 	case kw == "" && len(ev.Attachments) == 0, kw == "help": // an image alone is a prompt
 		s.replyAsync(bot, ev.RoomID, ev.ResponseURL, helpText)
 	case (kw == "pair" || kw == "unpair") && fromBot:
@@ -415,6 +455,121 @@ func (s *Server) onMention(bot *Bot, ev tanka.MentionEvent, raw []byte, rawTS, r
 	default:
 		s.enqueue(bot, ev, text, raw, rawTS, rawSig)
 	}
+}
+
+// mentionForWorker handles a mention for a bot with verify "worker". The server cannot tell a
+// forged event from a real one, so it posts nothing to a room that is not paired, and pair and
+// unpair go to the device as tasks that take effect only once the device has verified the
+// event and confirms (see confirmAction). help is static text, so a paired room still gets it.
+func (s *Server) mentionForWorker(bot *Bot, ev tanka.MentionEvent, kw, arg, text string, raw []byte, rawTS, rawSig string) {
+	bound, err := s.deviceWhere(`id = (SELECT device_id FROM bindings WHERE bot = ? AND room_id = ?)`, bot.Name, ev.RoomID)
+	if err != nil && !errors.Is(err, sql.ErrNoRows) {
+		log.Printf("bot %s room=%s: %v", bot.Name, ev.RoomID, err)
+		return
+	}
+	paired := err == nil
+	target := bound
+	if kw == "pair" {
+		target, err = s.deviceWhere(`id = ?`, arg)
+		if err != nil || target.Bot != bot.Name || !s.online(target) {
+			log.Printf("bot %s room=%s: pair %q not forwarded: no online device of this bot by that id", bot.Name, ev.RoomID, arg)
+			return
+		}
+	}
+	if target != nil && !s.verifiesAll(target.ID) {
+		// Such a device would run this unverified event as it is.
+		log.Printf("bot %s room=%s: device %s does not report tanka_verify \"require\", so nothing is queued for it", bot.Name, ev.RoomID, target.ID)
+		return
+	}
+	switch {
+	case (kw == "pair" || kw == "unpair") && ev.SenderType == "bot":
+		log.Printf("bot %s room=%s user=%s: %s from a bot ignored", bot.Name, ev.RoomID, ev.UserID, kw)
+	case kw == "pair":
+		s.forward(bot, target, ev, text, kw, raw, rawTS, rawSig)
+	case !paired:
+		log.Printf("bot %s room=%s user=%s: room not paired, nothing posted", bot.Name, ev.RoomID, ev.UserID)
+	case kw == "unpair":
+		s.forward(bot, bound, ev, text, kw, raw, rawTS, rawSig)
+	case kw == "" && len(ev.Attachments) == 0, kw == "help":
+		s.replyAsync(bot, ev.RoomID, ev.ResponseURL, helpText)
+	default:
+		s.enqueue(bot, ev, text, raw, rawTS, rawSig)
+	}
+}
+
+// verifiesAll reports whether device dev said at its last poll that it verifies every task.
+func (s *Server) verifiesAll(dev string) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.verifies[dev] == "require"
+}
+
+// forward queues cmd for device d to confirm, with the event it came in, sealed.
+func (s *Server) forward(bot *Bot, d *device, ev tanka.MentionEvent, text, cmd string, raw []byte, rawTS, rawSig string) {
+	t := proto.Task{RoomID: ev.RoomID, RoomName: ev.RoomName, UserID: ev.UserID, UserName: ev.UserName, Text: text, SenderType: ev.SenderType, Command: cmd, Raw: raw, RawTS: rawTS, RawSig: rawSig}
+	id, err := s.insertTask(bot, d, t, ev.UserID, ev.ResponseURL, "")
+	if err != nil {
+		log.Printf("bot %s room=%s: %s for device %s not queued: %v", bot.Name, ev.RoomID, cmd, d.ID, err)
+		return
+	}
+	log.Printf("task %s queued bot=%s room=%s device=%s: %s to confirm", id, bot.Name, ev.RoomID, d.ID, cmd)
+}
+
+// confirmAction carries out the pair or unpair device d was asked to confirm, and returns what
+// to post. Unconfirmed, nothing changes and nothing is posted: the event may have been forged.
+func (s *Server) confirmAction(d *device, rt *replyTo, confirmed bool) string {
+	if !confirmed {
+		log.Printf("bot %s room=%s: %s not confirmed by device %s", rt.Bot, rt.Room, rt.Action, d.ID)
+		return ""
+	}
+	switch rt.Action {
+	case "pair":
+		if err := s.bind(rt.Bot, rt.Room, d.ID, rt.RoomName, rt.By); err != nil {
+			log.Printf("pair: %v", err)
+			return "Pairing failed: the server could not save it."
+		}
+		log.Printf("bot %s room %s paired with device %s by %s (confirmed by the device)", rt.Bot, rt.Room, d.ID, rt.By)
+		return fmt.Sprintf("Paired this room with device `%s` (%s). Mention me with a prompt to run it there.", d.ID, d.Name)
+	case "unpair":
+		res, err := s.db.Exec(`DELETE FROM bindings WHERE bot = ? AND room_id = ? AND device_id = ?`, rt.Bot, rt.Room, d.ID)
+		if err != nil {
+			log.Printf("unpair: %v", err)
+			return "Unpairing failed: the server could not save it."
+		}
+		if n, _ := res.RowsAffected(); n == 0 {
+			return fmt.Sprintf("This room is not paired with device `%s`.", d.ID)
+		}
+		log.Printf("bot %s room %s unpaired from device %s (confirmed by the device)", rt.Bot, rt.Room, d.ID)
+		return fmt.Sprintf("Unpaired this room from device `%s`.", d.ID)
+	}
+	return ""
+}
+
+// allow counts one event against key in the current minute and reports whether it is within
+// limit. All counts start again each minute, so the map cannot grow for long.
+func (s *Server) allow(key string, limit int) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if now := s.now(); now.Sub(s.rateAt) >= time.Minute {
+		s.rate, s.rateAt = map[string]int{}, now
+	}
+	s.rate[key]++
+	return s.rate[key] <= limit
+}
+
+// clientIP is who sent r: Cloudflare's CF-Connecting-IP when r came through a tunnel on this
+// machine, the peer address otherwise (on a direct connection the header is anyone's to set).
+func clientIP(r *http.Request) string {
+	host, _, err := net.SplitHostPort(r.RemoteAddr)
+	if err != nil {
+		host = r.RemoteAddr
+	}
+	if ip := net.ParseIP(host); ip != nil && ip.IsLoopback() {
+		if cf := r.Header.Get("CF-Connecting-IP"); cf != "" {
+			return cf
+		}
+	}
+	return host
 }
 
 // botHop counts a bot-sent mention in room and returns how many have arrived in a row. A
@@ -542,7 +697,7 @@ func (s *Server) insertTask(bot *Bot, d *device, t proto.Task, sender, responseU
 		s.mu.Unlock()
 		return "", errQueueFull
 	}
-	s.waiting[d.ID] = append(s.waiting[d.ID], &task{id: id, dev: d.ID, bot: bot.Name, room: t.RoomID, sealed: sealed, reply: responseURL, msg: msg, created: s.now()})
+	s.waiting[d.ID] = append(s.waiting[d.ID], &task{id: id, dev: d.ID, bot: bot.Name, room: t.RoomID, sealed: sealed, reply: responseURL, msg: msg, action: t.Command, roomName: t.RoomName, by: t.UserID, created: s.now()})
 	s.logQueued(id, bot.Name, d.ID, t, sender, len(sealed), n+1) // under mu, so a lease cannot log first
 	s.mu.Unlock()
 	s.signal(d.ID)
@@ -724,7 +879,7 @@ func (s *Server) lease(dev string) (*proto.Envelope, error) {
 	s.leased[t.id] = t
 	s.mu.Unlock()
 	s.logLeased(t.id, t.until)
-	plain, _ := json.Marshal(replyTo{Dev: t.dev, Bot: t.bot, Room: t.room, URL: t.reply, Until: t.until.UnixMilli(), Msg: t.msg})
+	plain, _ := json.Marshal(replyTo{Dev: t.dev, Bot: t.bot, Room: t.room, URL: t.reply, Until: t.until.UnixMilli(), Msg: t.msg, Action: t.action, RoomName: t.roomName, By: t.by})
 	boxed, err := seal.Box(s.key, "reply "+t.id, plain)
 	if err != nil {
 		return nil, err
@@ -747,7 +902,7 @@ func (s *Server) taken(dev, id string, boxed []byte) *replyTo {
 	s.mu.Unlock()
 	var rt replyTo
 	if t != nil {
-		rt = replyTo{Dev: t.dev, Bot: t.bot, Room: t.room, URL: t.reply, Until: t.until.UnixMilli(), Msg: t.msg}
+		rt = replyTo{Dev: t.dev, Bot: t.bot, Room: t.room, URL: t.reply, Until: t.until.UnixMilli(), Msg: t.msg, Action: t.action, RoomName: t.roomName, By: t.by}
 	} else if plain, err := seal.Unbox(s.key, "reply "+id, boxed); err != nil || json.Unmarshal(plain, &rt) != nil || rt.Dev != dev {
 		return nil
 	}
@@ -784,6 +939,9 @@ func (s *Server) handleResult(w http.ResponseWriter, r *http.Request) {
 	if rt == nil {
 		http.Error(w, "unknown task", http.StatusNotFound)
 		return
+	}
+	if rt.Action != "" {
+		res = proto.Result{Text: s.confirmAction(d, rt, res.Confirm)} // the device's own text is not posted
 	}
 	if rt.Msg != "" && res.SessionID != "" {
 		s.logMention(rt.Msg, rt.Bot, rt.Room, res.SessionID)

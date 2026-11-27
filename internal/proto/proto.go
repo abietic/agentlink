@@ -21,6 +21,9 @@ type WorkerStatus struct {
 	Running int            `json:"running"` // runs in progress
 	Queued  int            `json:"queued"`  // tasks it has taken but not started
 	Limits  []HarnessLimit `json:"limits,omitempty"`
+	// TankaVerify is the worker's tanka_verify. A bot with verify "worker" queues nothing for
+	// a device that does not report "require", since that device would run unsigned events.
+	TankaVerify string `json:"tanka_verify,omitempty"`
 }
 
 // HarnessLimit is a harness resting at a usage limit.
@@ -65,6 +68,10 @@ type Task struct {
 	Raw    []byte `json:"raw,omitempty"`
 	RawTS  string `json:"raw_ts,omitempty"`
 	RawSig string `json:"raw_sig,omitempty"`
+	// Command is "pair" or "unpair" when a bot with verify "worker" asks this device to
+	// confirm one typed in the room: the server could not check the event, so the binding
+	// changes only if the device verifies it and answers with Result.Confirm.
+	Command string `json:"command,omitempty"`
 	// Reply is the Envelope's Reply, kept by the worker to send back with the result.
 	Reply []byte `json:"-"`
 }
@@ -82,6 +89,9 @@ type Result struct {
 	// SessionID is the session the reply came from, if a run made it; the server keeps it
 	// with the post so a later reply quoting it can be routed there (see RouteSessionID).
 	SessionID string `json:"session_id,omitempty"`
+	// Confirm answers a Task.Command: the device verified the event and its sender, so the
+	// server may carry the command out. The server posts its own message about it.
+	Confirm bool `json:"confirm,omitempty"`
 }
 
 // TriggerRequest asks the server to queue a triggered task for the device paired with

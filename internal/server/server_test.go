@@ -152,6 +152,7 @@ type testDevice struct {
 	key     *ecdh.PrivateKey
 	base    string
 	replies map[string][]byte // each task's Envelope.Reply, sent back with its result
+	status  string            // proto.WorkerStatus JSON sent with each poll, if set
 }
 
 func register(t *testing.T, base, bot string) *testDevice {
@@ -168,7 +169,20 @@ func register(t *testing.T, base, bot string) *testDevice {
 func (d *testDevice) poll(t *testing.T) *proto.Task {
 	t.Helper()
 	var env proto.Envelope
-	code := api(t, http.MethodGet, d.base+"/api/v1/poll", d.DeviceToken, nil, &env)
+	req, _ := http.NewRequest(http.MethodGet, d.base+"/api/v1/poll", nil)
+	req.Header.Set("Authorization", "Bearer "+d.DeviceToken)
+	if d.status != "" {
+		req.Header.Set(proto.HeaderWorkerStatus, d.status)
+	}
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	code := resp.StatusCode
+	if code == http.StatusOK {
+		json.NewDecoder(resp.Body).Decode(&env)
+	}
 	if code == http.StatusNoContent {
 		return nil
 	}

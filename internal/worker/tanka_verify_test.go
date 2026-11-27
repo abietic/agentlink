@@ -3,6 +3,7 @@ package worker
 import (
 	"bytes"
 	"context"
+	"crypto/ecdh"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -30,6 +31,36 @@ type apiCapture struct {
 	*httptest.Server
 	mu      sync.Mutex
 	results []proto.Envelope
+	// The keys the worker under test seals its results with, to open them again.
+	serverKey *ecdh.PrivateKey
+	deviceKey *ecdh.PublicKey
+}
+
+// spoken counts the results that carry text, which the server would post.
+func (c *apiCapture) spoken(t *testing.T) int {
+	n := 0
+	for _, r := range c.opened(t) {
+		if r.Text != "" {
+			n++
+		}
+	}
+	return n
+}
+
+// opened returns the results posted so far, opened.
+func (c *apiCapture) opened(t *testing.T) []proto.Result {
+	t.Helper()
+	var out []proto.Result
+	for _, env := range c.posted() {
+		plain, err := seal.Open(c.serverKey, c.deviceKey, proto.ResultContext("dev-test", env.ID), env.Sealed)
+		if err != nil {
+			t.Fatalf("result %s does not open: %v", env.ID, err)
+		}
+		var res proto.Result
+		json.Unmarshal(plain, &res)
+		out = append(out, res)
+	}
+	return out
 }
 
 func newAPICapture(t *testing.T) *apiCapture {
@@ -103,7 +134,9 @@ func newVerifiedWorker(t *testing.T, mode string, api *apiCapture) (*fixture, *W
 	if err != nil {
 		t.Fatal(err)
 	}
-	w.setIdentity(Identity{DeviceID: "dev-test", DeviceKey: seal.NewPrivateKey().Bytes(), ServerKey: seal.NewPrivateKey().PublicKey().Bytes()})
+	dev := seal.NewPrivateKey()
+	api.serverKey, api.deviceKey = seal.NewPrivateKey(), dev.PublicKey()
+	w.setIdentity(Identity{DeviceID: "dev-test", DeviceKey: dev.Bytes(), ServerKey: api.serverKey.PublicKey().Bytes()})
 	now := time.Now()
 	w.now = func() time.Time { return now }
 	return f, w, now
@@ -270,9 +303,13 @@ func TestRequireDropsUnverified(t *testing.T) {
 	} {
 		w.dispatch(context.Background(), task)
 	}
-	time.Sleep(300 * time.Millisecond)
-	if got := api.posted(); len(got) != 0 {
-		t.Fatalf("%d reply(ies) posted for rejected tasks", len(got))
+	// Each gets an empty result, which the server posts nothing for, so it does not time out
+	// and get announced as dropped either.
+	api.waitResults(t, 2)
+	for _, res := range api.opened(t) {
+		if res.Text != "" || res.Confirm {
+			t.Fatalf("a rejected task got result %+v", res)
+		}
 	}
 	if runCount(t, f.log) != 0 {
 		t.Fatal("a rejected task was run")
@@ -313,12 +350,12 @@ func TestTankaReplaySurvivesRestart(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	w2.setIdentity(Identity{DeviceID: "dev-test", DeviceKey: seal.NewPrivateKey().Bytes(), ServerKey: seal.NewPrivateKey().PublicKey().Bytes()})
+	w2.setIdentity(w.id)
 	w2.now = func() time.Time { return now }
 	w2.dispatch(context.Background(), ev.task("replay", "R1"))
-	time.Sleep(300 * time.Millisecond)
-	if got := api.posted(); len(got) != 1 {
-		t.Fatalf("a replay was answered after the restart: %d result(s)", len(got))
+	api.waitResults(t, 2)
+	if n := api.spoken(t); n != 1 {
+		t.Fatalf("a replay was answered after the restart: %d non-empty result(s)", n)
 	}
 	if w2.tankaRejected != 1 {
 		t.Fatalf("rejected after restart = %d, want 1", w2.tankaRejected)
@@ -370,9 +407,9 @@ func TestTriggerLedger(t *testing.T) {
 
 	// A task the server made itself has no record: refused, no reply.
 	w.dispatch(context.Background(), proto.Task{ID: "forged", RoomID: "R1", Trigger: "alerts", Key: "forged", Text: "rm -rf"})
-	time.Sleep(300 * time.Millisecond)
-	if got := api.posted(); len(got) != 0 {
-		t.Fatalf("a forged trigger task was run: %d result(s)", len(got))
+	api.waitResults(t, 1)
+	if n := api.spoken(t); n != 0 {
+		t.Fatalf("a forged trigger task was answered: %d non-empty result(s)", n)
 	}
 	if runCount(t, f.log) != 0 || w.tankaRejected != 1 {
 		t.Fatalf("forged trigger: runs %d, rejected %d", runCount(t, f.log), w.tankaRejected)
@@ -384,14 +421,14 @@ func TestTriggerLedger(t *testing.T) {
 		t.Fatal(err)
 	}
 	w.dispatch(ctx, proto.Task{ID: "legit", RoomID: "R1", Trigger: "alerts", Key: "k1", Text: "do the thing"})
-	api.waitResults(t, 1)
+	api.waitResults(t, 2)
 	if runCount(t, f.log) != 1 {
 		t.Fatal("a submitted trigger task was not run")
 	}
 	w.dispatch(ctx, proto.Task{ID: "replay", RoomID: "R1", Trigger: "alerts", Key: "k1", Text: "do the thing"})
-	time.Sleep(300 * time.Millisecond)
-	if got := api.posted(); len(got) != 1 {
-		t.Fatalf("a trigger task was accepted twice: %d result(s)", len(got))
+	api.waitResults(t, 3)
+	if n := api.spoken(t); n != 1 || runCount(t, f.log) != 1 {
+		t.Fatalf("a trigger task was accepted twice: %d non-empty result(s)", n)
 	}
 
 	// The record outlives a restart, and is still good for one task only.
@@ -404,13 +441,13 @@ func TestTriggerLedger(t *testing.T) {
 	}
 	w2.setIdentity(w.id)
 	w2.dispatch(ctx, proto.Task{ID: "restarted", RoomID: "R1", Trigger: "alerts", Key: "k2", Text: "after restart"})
-	api.waitResults(t, 2)
+	api.waitResults(t, 4)
 	if runCount(t, f.log) != 2 {
 		t.Fatal("a submitted trigger did not survive the restart")
 	}
 	w2.dispatch(ctx, proto.Task{ID: "restarted-again", RoomID: "R1", Trigger: "alerts", Key: "k2", Text: "after restart"})
-	time.Sleep(300 * time.Millisecond)
-	if got := api.posted(); len(got) != 2 {
+	api.waitResults(t, 5)
+	if n := api.spoken(t); n != 2 || runCount(t, f.log) != 2 {
 		t.Fatal("a trigger task was accepted twice after the restart")
 	}
 
@@ -419,7 +456,7 @@ func TestTriggerLedger(t *testing.T) {
 		t.Fatal(err)
 	}
 	w.dispatch(ctx, proto.Task{ID: "digest", RoomID: "R1", Trigger: digestTrigger, Key: "2026-11-27T00:00:00Z", Text: "digest text"})
-	api.waitResults(t, 3)
+	api.waitResults(t, 6)
 	if runCount(t, f.log) != 2 {
 		t.Fatal("the digest was run as a prompt")
 	}
@@ -490,5 +527,44 @@ func TestSetSecretRoundTrip(t *testing.T) {
 	}
 	if err := SetSecret(f.cfg, "other", []byte(value)); err == nil {
 		t.Fatal("an unknown secret name was accepted")
+	}
+}
+
+// TestConfirmCommand checks that a pair or unpair the server forwards is confirmed only for a
+// verified event from a person in allowed_users, naming this device for pair, and is never run.
+func TestConfirmCommand(t *testing.T) {
+	api := newAPICapture(t)
+	f, w, now := newVerifiedWorker(t, "require", api)
+	cases := []struct {
+		name, cmd, text, user, sender string
+		tamper                        bool
+		want                          bool
+	}{
+		{"pair this device", "pair", "@bot pair dev-test", "U1", "", false, true},
+		{"pair another device", "pair", "@bot pair dev-other", "U1", "", false, false},
+		{"unpair", "unpair", "@bot unpair", "U1", "", false, true},
+		{"unpair by a stranger", "unpair", "@bot unpair", "U9", "", false, false},
+		{"pair by a bot", "pair", "@bot pair dev-test", "U1", "bot", false, false},
+		{"text says otherwise", "unpair", "@bot pair dev-test", "U1", "", false, false},
+		{"forged event", "pair", "@bot pair dev-test", "U1", "", true, false},
+	}
+	for i, tc := range cases {
+		ev := newSignedEvent(testTankaSecret, now.Add(time.Duration(i)*time.Second), func(env *tanka.Envelope) {
+			env.Event.Text, env.Event.UserID, env.Event.SenderType = tc.text, tc.user, tc.sender
+		})
+		if tc.tamper {
+			ev.sig = tanka.Sign([]byte("not-the-secret"), ev.ts, ev.body)
+		}
+		task := ev.task(fmt.Sprintf("c%d", i), "R1")
+		task.UserID, task.Command = "U1", tc.cmd // the server's claims, which must not count
+		w.dispatch(context.Background(), task)
+		api.waitResults(t, i+1)
+		res := api.opened(t)[i]
+		if res.Confirm != tc.want || res.Text != "" {
+			t.Errorf("%s: result %+v, want confirm %v", tc.name, res, tc.want)
+		}
+	}
+	if runCount(t, f.log) != 0 {
+		t.Fatal("a command was run as a prompt")
 	}
 }

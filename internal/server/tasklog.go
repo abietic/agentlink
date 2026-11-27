@@ -116,6 +116,9 @@ func (s *Server) noteStatus(dev, header string) {
 	if header == "" || len(header) > 4096 || json.Unmarshal([]byte(header), &st) != nil {
 		return
 	}
+	s.mu.Lock()
+	s.verifies[dev] = st.TankaVerify
+	s.mu.Unlock()
 	b, _ := json.Marshal(st) // only the fields this server knows
 	s.logExec("status", `INSERT INTO device_stats (device_id, status, status_at) VALUES (?, ?, ?)
 		ON CONFLICT (device_id) DO UPDATE SET status = excluded.status, status_at = excluded.status_at`, dev, string(b), s.now().UnixMilli())

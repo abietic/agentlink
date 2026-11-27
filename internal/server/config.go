@@ -24,6 +24,12 @@ type Bot struct {
 	SigningSecret string `json:"signing_secret"`
 	// Mentions are the bot's display names, so "@Name with spaces" is stripped whole.
 	Mentions []string `json:"mentions"`
+	// Verify says who checks Tanka's signature: "server" (the default) or "worker". With
+	// "worker" the server holds no signing secret and trusts no event: it answers
+	// url_verification, rate-limits events, posts nothing for a room that is not paired, and
+	// pair / unpair take effect only once the device has verified the event and confirmed.
+	// Use it only with workers at tanka_verify "require", which verify every task.
+	Verify string `json:"verify"`
 	// RoomWebhooks maps room_id to an incoming-webhook URL, used when response_url is
 	// missing, expired or already used, and for triggered tasks, which have none. Webhook
 	// URLs are credentials: AGENTLINK_ROOM_WEBHOOKS_<NAME>, a JSON object, adds to them.
@@ -113,7 +119,11 @@ func (c *Config) check() error {
 			return fmt.Errorf("bot name %q: use lowercase letters, digits and -", b.Name)
 		case seen[b.Name]:
 			return fmt.Errorf("bot %q is listed twice", b.Name)
-		case b.SigningSecret == "":
+		case b.Verify != "" && b.Verify != "server" && b.Verify != "worker":
+			return fmt.Errorf(`bot %q: verify must be "server" or "worker"`, b.Name)
+		case b.Verify == "worker" && b.SigningSecret != "":
+			return fmt.Errorf(`bot %q: verify "worker" means the server does not hold the signing secret: remove signing_secret (and %s)`, b.Name, botEnv("AGENTLINK_SIGNING_SECRET_", b.Name))
+		case b.Verify != "worker" && b.SigningSecret == "":
 			return fmt.Errorf("bot %q: signing_secret (or %s) is required", b.Name, botEnv("AGENTLINK_SIGNING_SECRET_", b.Name))
 		}
 		for room, dev := range b.Rooms {

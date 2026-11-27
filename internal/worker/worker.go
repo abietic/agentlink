@@ -312,7 +312,7 @@ func (w *Worker) Run(ctx context.Context) error {
 func (w *Worker) status() proto.WorkerStatus {
 	w.mu.Lock()
 	defer w.mu.Unlock()
-	st := proto.WorkerStatus{Version: proto.Version, Running: len(w.running)}
+	st := proto.WorkerStatus{Version: proto.Version, Running: len(w.running), TankaVerify: w.cfg.TankaVerify}
 	for _, q := range w.queues {
 		st.Queued += len(q.tasks)
 	}
@@ -327,7 +327,14 @@ func (w *Worker) status() proto.WorkerStatus {
 
 func (w *Worker) dispatch(ctx context.Context, t proto.Task) {
 	if !w.checkTanka(&t) {
-		return // rejected: no reply is posted, so a forged task cannot reach the room
+		// Rejected: an empty result posts nothing, so a forged task cannot reach the room,
+		// and the server does not announce it as timed out either.
+		go w.post(t, "")
+		return
+	}
+	if t.Command != "" {
+		go w.confirmCommand(t)
+		return
 	}
 	if t.Trigger == digestTrigger {
 		// The worker's own digest, back from the server: post it as it is, with no run. Only
@@ -538,6 +545,30 @@ func (w *Worker) post(t proto.Task, text string) {
 	if tr := w.trigger(t.Trigger); tr != nil {
 		res.Theme = theme(tr.Themes, text)
 	}
+	w.deliver(t, res, &rec)
+}
+
+// confirmCommand answers a server's request to confirm a pair or unpair typed in the room
+// (see proto.Task.Command). It confirms only what a person in allowed_users typed, and pair
+// only when it names this device; the event itself was verified by checkTanka already.
+func (w *Worker) confirmCommand(t proto.Task) {
+	word, arg := proto.CutWord(t.Text)
+	ok := t.Trigger == "" && t.SenderType != "bot" && slices.Contains(w.cfg.AllowedUsers, t.UserID) && proto.Keyword(word) == t.Command
+	switch t.Command {
+	case "pair":
+		ok = ok && arg == w.id.DeviceID
+	case "unpair":
+	default:
+		ok = false
+	}
+	log.Printf("task %s: %s from user %s confirmed: %v", t.ID, t.Command, t.UserID, ok)
+	rec := runRecord{Event: "result", Task: t.ID}
+	defer func() { w.logRun(rec) }()
+	w.deliver(t, proto.Result{Confirm: ok}, &rec)
+}
+
+// deliver seals and posts res, retrying only when the request may not have reached the server.
+func (w *Worker) deliver(t proto.Task, res proto.Result, rec *runRecord) {
 	plain, _ := json.Marshal(res)
 	sealed, err := seal.Seal(w.key, w.serverKey, proto.ResultContext(w.id.DeviceID, t.ID), plain)
 	if err != nil {
